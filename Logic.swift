@@ -256,16 +256,38 @@ func numbersIn(_ fileName: String) -> Set<Int> {
     return s
 }
 
-// 在封面列表里找与视频集数匹配的封面（数字交集最大者）
-func findCover(forVideo videoPath: String, covers: [String]) -> String? {
-    let vn = numbersIn(videoPath)
-    guard !vn.isEmpty else { return nil }
-    var best: (String, Int)?
-    for c in covers {
-        let overlap = numbersIn(c).intersection(vn).count
-        if overlap > 0 && overlap > (best?.1 ?? 0) { best = (c, overlap) }
+// 分辨率/码率等常见「非集数」数字：只有在文件名里没有 EP 标记时才用它们排除干扰
+private let nonEpisodeNumbers: Set<Int> = [240, 360, 480, 720, 1080, 1440, 2160, 4320]
+
+/// 取文件名里的集数（**只看文件名，不看上层目录**，否则「…31-45导出」这类文件夹名会把 45 也算进来）
+/// 优先级：EP31 / 第31集 标记 → 去掉 "(1)" 副本标记后的最后一个数字（排除分辨率、年份）
+func episodeNumber(in pathOrName: String) -> Int? {
+    let file = URL(fileURLWithPath: pathOrName).lastPathComponent
+    var base = (file as NSString).deletingPathExtension
+    if let m = firstMatch("(?:ep|第)\\s*(\\d+)", base), let v = Int(m[1]) { return v }
+    if let re = try? NSRegularExpression(pattern: "\\(\\s*\\d+\\s*\\)") {
+        let ns = base as NSString
+        base = re.stringByReplacingMatches(in: base, range: NSRange(location: 0, length: ns.length), withTemplate: " ")
     }
-    return best?.0
+    guard let re = try? NSRegularExpression(pattern: "\\d+") else { return nil }
+    let ns = base as NSString
+    var nums: [Int] = []
+    for m in re.matches(in: base, range: NSRange(location: 0, length: ns.length)) {
+        if let v = Int(ns.substring(with: m.range)) { nums.append(v) }
+    }
+    // 排除分辨率与年份，剩下取最后一个（命名习惯上集数靠后）
+    let filtered = nums.filter { !nonEpisodeNumbers.contains($0) && !(1900..<2100).contains($0) }
+    return filtered.last ?? nums.last
+}
+
+// 在封面列表里找与视频集数匹配的封面：集数必须精确相等
+func findCover(forVideo videoPath: String, covers: [String]) -> String? {
+    guard let ep = episodeNumber(in: videoPath) else { return nil }
+    let sorted = covers.sorted {
+        URL(fileURLWithPath: $0).lastPathComponent < URL(fileURLWithPath: $1).lastPathComponent
+    }
+    for c in sorted where episodeNumber(in: c) == ep { return c }
+    return nil
 }
 
 // ---------- 统一抽帧: 多视频，每隔 step 秒一帧，帧名从 startName 依次 +1 加 suffix ----------

@@ -89,6 +89,8 @@ struct ContentView: View {
         content()
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .opacity(section == tag ? 1 : 0)
+            // 移出可视区：只靠 allowsHitTesting 不够，隐藏层仍会抢占拖放落点
+            .offset(x: section == tag ? 0 : 20000)
             .allowsHitTesting(section == tag)
     }
 
