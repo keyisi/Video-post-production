@@ -4,6 +4,10 @@
 
 ![Version](https://img.shields.io/badge/version-3.14.1-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
 
+![Release](https://img.shields.io/badge/release-latest-green)
+
+最新版本安装包见 [Releases](https://github.com/keyisi/video-post-production/releases/latest)（`Video_Post-Production_v*.zip`，内置 ffmpeg，解压即用）。
+
 版本规则 `x.y.z`：新功能/大改动进 `y`（`z` 归 0，如 3.15.0），修 bug 或小调整只进 `z`（如 3.14.1）。
 
 ## 功能板块
