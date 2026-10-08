@@ -94,8 +94,11 @@ swiftc -disable-sandbox -O main.swift Logic.swift -o build/videopost-cli
 ├── Logic.swift      # 引擎：抽帧/封面/结尾(EndingEngine)/整理(DramaOrganizer)
 ├── main.swift       # CLI 入口与路由
 ├── screenshots/     # 四个板块的界面截图
+├── 调试记录.md       # 每次排查/修复的归档（现象→根因→修复→验证）
 └── build/           # 现成的 App（内置 ffmpeg / ffprobe）
 ```
+
+每次修 bug 都会同步写入 `调试记录.md`（含环境/工具链踩坑与「改了没生效」排查清单）。
 
 ## 设计说明
 
