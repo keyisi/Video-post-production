@@ -2,7 +2,7 @@
 
 一款为短剧/批量视频后期处理打造的 macOS 原生工具（SwiftUI + 内置 ffmpeg），把「抽帧、封面、结尾效果、整理归档」四件事装进一个 App。
 
-![Version](https://img.shields.io/badge/version-3.13-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
+![Version](https://img.shields.io/badge/version-3.14-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
 
 ## 功能板块
 
@@ -20,6 +20,7 @@
 ![插入封面](screenshots/02_插入封面.png)
 
 - 为视频开头插入一张封面帧（单图或整个封面目录，自动按集数配对，如 EP21 ↔ 封面21）
+- **集数精确匹配**：只认文件名里的集数（优先 `EP21` / `第21集`，其次取末位数字），**上层文件夹名不参与匹配** —— 视频放在「剧名31-45导出」这类目录里也不会配错；封面带 `EP31_cover` 后缀同样能认出来
 - 输出体积档位：**跟随原片**（按源码率，体积约等于原片）／**高质量**（CRF 18）
 - 默认输出到每个视频旁边的「加封面」文件夹
 - 右下角「继续到结尾处理」按钮：一键把视频和封面带到结尾处理板块，合并成一次编码，避免二次转码
@@ -98,7 +99,8 @@ swiftc -disable-sandbox -O main.swift Logic.swift -o build/videopost-cli
 
 ## 设计说明
 
-- 四个板块用 `ZStack` 常驻视图树，切换只改 `opacity / allowsHitTesting`，不销毁 View，因此 `@State` 内容不丢
+- 四个板块用 `ZStack` 常驻视图树，切换只改 `opacity / allowsHitTesting`，不销毁 View，因此 `@State` 内容不丢；非当前板块还会 `offset` 移出可视区，避免隐藏层抢占拖放落点
+- 封面配对用 `episodeNumber(in:)`：**只解析文件名**（不看上层目录，避免「31-45导出」这类文件夹名污染集数），优先 `EPxx / 第N集` 标记，其次剔除 `(1)` 副本标记与分辨率/年份后取末位数字，最后做**集数精确相等**匹配
 - 设置通过 `@AppStorage`（UserDefaults，键前缀 `fxt_`）持久化，重开 App 自动恢复
 - 内置 ffmpeg 定位优先级：App 包内 Resources → `~/.local/bin` → `/opt/homebrew/bin` 等系统路径
 - 进度来自 ffmpeg `-progress pipe:1` 的 `out_time_us` 实时解析，不是估算
