@@ -6,7 +6,7 @@
 
 ![Release](https://img.shields.io/badge/release-latest-green)
 
-最新版本安装包见 [Releases](https://github.com/keyisi/video-post-production/releases/latest)（`Video_Post-Production_v*.zip`，内置 ffmpeg，解压即用）。
+最新版本安装包见 [Releases](https://github.com/keyisi/video-post-production/releases/latest)：`.dmg`（推荐，拖进「应用程序」）或 `.zip`，内置 ffmpeg，无需额外安装。
 
 版本规则 `x.y.z`：新功能/大改动进 `y`（`z` 归 0，如 3.15.0），修 bug 或小调整只进 `z`（如 3.14.1）。
 
