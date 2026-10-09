@@ -252,25 +252,10 @@ struct ContentView: View {
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 7) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .frame(width: 22, height: 22)
-                    .clipShape(RoundedRectangle(cornerRadius: 5))
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("Video Post")
-                        .font(.system(size: 11.5, weight: .bold))
-                    Text("Production")
-                        .font(.system(size: 11.5, weight: .bold))
-                }
-            }
-            .padding(.horizontal, 14)
-            .padding(.top, 16)
-            .padding(.bottom, 14)
-
             ForEach(navItems, id: \.tag) { item in
                 navButton(item.title, icon: item.icon, tag: item.tag)
             }
+            .padding(.top, 16)
 
             Spacer()
 
