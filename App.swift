@@ -37,7 +37,7 @@ struct FrameToolApp: App {
             ContentView()
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 940, height: 700)
+        .defaultSize(width: 1080, height: 700)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(after: .appInfo) {
@@ -206,36 +206,9 @@ struct ContentView: View {
     @StateObject private var updates = UpdateCenter()
 
     var body: some View {
-        VStack(spacing: 0) {
-            // 顶栏: 板块切换 + 右侧版本/更新提示
-            HStack {
-                Spacer()
-                HStack(spacing: 2) {
-                    tabButton("视频抽帧", icon: "photo.on.rectangle.angled", tag: 0)
-                    tabButton("插入封面", icon: "photo.badge.plus", tag: 1)
-                    tabButton("结尾处理", icon: "flag.checkered", tag: 2)
-                    tabButton("整理归档", icon: "archivebox", tag: 3)
-                    tabButton("关于与更新", icon: "info.circle", tag: 4)
-                }
-                .padding(3)
-                .background(Color(nsColor: .controlBackgroundColor))
-                .clipShape(Capsule())
-                .overlay(Capsule().stroke(Color.primary.opacity(0.08)))
-                .shadow(color: .black.opacity(0.06), radius: 3, y: 1)
-                Spacer()
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 14)
-            .padding(.bottom, 12)
-            .overlay(alignment: .trailing) {
-                updateBadge
-                    .padding(.trailing, 20)
-                    .alert(updates.noticeTitle, isPresented: $updates.showNotice) {
-                        Button("好") {}
-                    } message: {
-                        Text(updates.noticeText)
-                    }
-            }
+        HStack(spacing: 0) {
+            // 左侧导航栏
+            sidebar
 
             // 五个板块常驻视图树（不销毁）：切换回来时已选文件/日志/预览全部保留
             ZStack {
@@ -246,9 +219,10 @@ struct ContentView: View {
                 sectionLayer(4) { AboutView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.top, 2)
             .environmentObject(updates)
         }
-        .frame(minWidth: 860, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
+        .frame(minWidth: 960, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
         .background(Theme.page)
         .preferredColorScheme(nil)
         .task { updates.startupCheck() }
@@ -266,7 +240,88 @@ struct ContentView: View {
         }
     }
 
-    /// 右上角：版本号 / 检查中 / 新版本提示
+    // MARK: 侧边导航
+
+    private let navItems: [(title: String, icon: String, tag: Int)] = [
+        ("视频抽帧", "photo.on.rectangle.angled", 0),
+        ("插入封面", "photo.badge.plus", 1),
+        ("结尾处理", "flag.checkered", 2),
+        ("整理归档", "archivebox", 3),
+        ("关于与更新", "info.circle", 4),
+    ]
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 7) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .frame(width: 22, height: 22)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Video Post")
+                        .font(.system(size: 11.5, weight: .bold))
+                    Text("Production")
+                        .font(.system(size: 11.5, weight: .bold))
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 16)
+            .padding(.bottom, 14)
+
+            ForEach(navItems, id: \.tag) { item in
+                navButton(item.title, icon: item.icon, tag: item.tag)
+            }
+
+            Spacer()
+
+            updateBadge
+                .padding(.horizontal, 14)
+                .padding(.bottom, 14)
+                .alert(updates.noticeTitle, isPresented: $updates.showNotice) {
+                    Button("好") {}
+                } message: {
+                    Text(updates.noticeText)
+                }
+        }
+        .frame(width: 176)
+        .frame(maxHeight: .infinity)
+        .background(Theme.card)
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.07))
+                .frame(width: 1)
+        }
+    }
+
+    private func navButton(_ title: String, icon: String, tag: Int) -> some View {
+        let active = section == tag
+        return Button {
+            withAnimation(.easeOut(duration: 0.15)) { section = tag }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: active ? .semibold : .regular))
+                    .frame(width: 16)
+                Text(title)
+                    .font(.system(size: 12.5, weight: active ? .semibold : .regular))
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .foregroundStyle(active ? Color.white : Color.primary.opacity(0.72))
+            .background {
+                if active {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(LinearGradient(colors: [Theme.accent, Theme.accentDeep],
+                                             startPoint: .leading, endPoint: .trailing))
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 8)
+    }
+
+    /// 侧边栏底部：版本号 / 检查中 / 新版本提示
     @ViewBuilder
     private var updateBadge: some View {
         if updates.isChecking {
@@ -320,27 +375,6 @@ struct ContentView: View {
             .allowsHitTesting(section == tag)
     }
 
-    func tabButton(_ title: String, icon: String, tag: Int) -> some View {
-        let active = section == tag
-        return Button {
-            withAnimation(.easeOut(duration: 0.15)) { section = tag }
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: icon).font(.system(size: 11, weight: .semibold))
-                Text(title).font(.system(size: 12.5, weight: active ? .semibold : .regular))
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 6)
-            .foregroundStyle(active ? Color.white : Color.primary.opacity(0.65))
-            .background {
-                if active {
-                    Capsule().fill(LinearGradient(colors: [Theme.accent, Theme.accentDeep],
-                                                  startPoint: .leading, endPoint: .trailing))
-                }
-            }
-        }
-        .buttonStyle(.plain)
-    }
 }
 
 // MARK: - 通用小组件
