@@ -2,7 +2,7 @@
 
 一款为短剧/批量视频后期处理打造的 macOS 原生工具（SwiftUI + 内置 ffmpeg），把「抽帧、封面、结尾效果、整理归档」四件事装进一个 App。
 
-![Version](https://img.shields.io/badge/version-3.15.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
+![Version](https://img.shields.io/badge/version-3.16.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
 
 ![Release](https://img.shields.io/badge/release-latest-green)
 
@@ -57,6 +57,15 @@
 - 按模板批量重命名：`{剧名} EP{序号}` 等，支持 `{剧名} {序号} {日期} {时间} {原名} {扩展名}` 占位符
 - **普通视频原地改名**（不再生成「成片」文件夹）；带 `(N)` 副本标记的归到「纯净」，字幕文件归到「字幕」
 - 执行前预览改名对照、重复/冲突检测、执行后一键撤销、导出 CSV 对照表
+
+### 5. 关于与更新
+
+![关于与更新](screenshots/05_关于与更新.png)
+
+- 应用信息（版本、系统要求）+ GitHub 发布页 / 项目仓库直链
+- 更新状态一目了然：当前版本、上次检查时间、手动「检查更新」、发现新版本时可直接下载或跳过
+- 「最新版本说明」：一键拉取 GitHub 上最新 Release 的更新日志
+- 运行环境自检：内置 ffmpeg / ffprobe 的版本与路径
 - 模板不含 `{扩展名}` 时自动补全后缀，防止输出丢扩展名
 
 ## 运行要求

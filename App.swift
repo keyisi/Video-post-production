@@ -37,7 +37,7 @@ struct FrameToolApp: App {
             ContentView()
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 880, height: 700)
+        .defaultSize(width: 940, height: 700)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(after: .appInfo) {
@@ -62,20 +62,148 @@ extension Notification.Name {
     static let fxtCheckUpdate = Notification.Name("fxtCheckUpdate")
 }
 
+/// 更新检查中心：顶栏徽章与「关于与更新」板块共用同一份状态
+final class UpdateCenter: ObservableObject {
+    @Published private(set) var isChecking = false
+    @Published private(set) var found: ReleaseInfo?
+    @Published private(set) var noticeTitle = ""
+    @Published private(set) var noticeText = ""
+    @Published private(set) var lastCheckedAt: Double = 0
+    @Published var showNotice = false
+    @Published var showUpdateAlert = false
+
+    private let ud = UserDefaults.standard
+
+    init() {
+        lastCheckedAt = ud.double(forKey: "fxt_lastUpdateCheck")
+        restoreSavedUpdate()
+    }
+
+    var skippedVersion: String { ud.string(forKey: "fxt_skipVersion") ?? "" }
+
+    var lastCheckedText: String {
+        guard lastCheckedAt > 0 else { return "尚未检查" }
+        let d = Date(timeIntervalSince1970: lastCheckedAt)
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return "上次检查 \(f.string(from: d))"
+    }
+
+    var statusText: String {
+        if isChecking { return "正在检查…" }
+        if let info = found { return "发现新版本 \(info.version)" }
+        return "已是最新版本 v\(currentAppVersion())"
+    }
+
+    var updateAlertMessage: String {
+        guard let info = found else { return "" }
+        var msg = "当前版本 v\(currentAppVersion())，最新版本 v\(info.version)。"
+        if let name = info.assetName {
+            var size = ""
+            if let bytes = info.assetSize { size = "（\(prettySize(bytes))）" }
+            msg += "\n安装包：\(name)\(size)"
+        }
+        let notes = UpdateCheck.briefNotes(info.notes)
+        if !notes.isEmpty { msg += "\n\n" + notes }
+        return msg
+    }
+
+    /// 启动时自动检查：距上次检查超过 6 小时才联网
+    func startupCheck() {
+        let now = Date().timeIntervalSince1970
+        if now - lastCheckedAt < 6 * 3600 { return }
+        check(manual: false)
+    }
+
+    /// 上次发现过的新版本（跨重启仍显示提示）
+    private func restoreSavedUpdate() {
+        let v = ud.string(forKey: "fxt_newVersion") ?? ""
+        let url = ud.string(forKey: "fxt_newURL") ?? ""
+        guard !v.isEmpty, v != skippedVersion,
+              compareVersion(v, currentAppVersion()) > 0 else {
+            if !v.isEmpty && compareVersion(v, currentAppVersion()) <= 0 { clearSaved() }
+            return
+        }
+        var info = ReleaseInfo()
+        info.version = v
+        info.tag = v
+        info.htmlURL = url.isEmpty ? UpdateCheck.fallbackURL : url
+        found = info
+    }
+
+    func check(manual: Bool) {
+        guard !isChecking else { return }
+        isChecking = true
+        UpdateCheck.fetchLatest { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.isChecking = false
+                self.lastCheckedAt = Date().timeIntervalSince1970
+                self.ud.set(self.lastCheckedAt, forKey: "fxt_lastUpdateCheck")
+                switch result {
+                case .failure(let err):
+                    if manual { self.notify("检查更新失败", err.localizedDescription) }
+                case .success(let info):
+                    guard let info = info else {
+                        if manual { self.notify("暂无更新", "仓库还没有发布任何 Release。") }
+                        return
+                    }
+                    let current = currentAppVersion()
+                    if compareVersion(info.version, current) > 0 {
+                        if info.version == self.skippedVersion {
+                            self.clearSaved()
+                            if manual {
+                                self.notify("已是最新可安装版本",
+                                            "v\(info.version) 已跳过，当前 v\(current)。")
+                            }
+                            return
+                        }
+                        self.found = info
+                        self.ud.set(info.version, forKey: "fxt_newVersion")
+                        self.ud.set(info.htmlURL, forKey: "fxt_newURL")
+                        self.showUpdateAlert = true
+                    } else {
+                        self.found = nil
+                        self.clearSaved()
+                        if manual {
+                            self.notify("已是最新版本",
+                                        "当前 v\(current)，与 GitHub 上的最新版本一致。")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func skipCurrent() {
+        guard let info = found else { return }
+        ud.set(info.version, forKey: "fxt_skipVersion")
+        found = nil
+        clearSaved()
+    }
+
+    /// 清除「跳过此版本」记录，让提示重新出现
+    func resetPrompts() {
+        ud.removeObject(forKey: "fxt_skipVersion")
+        ud.removeObject(forKey: "fxt_lastUpdateCheck")
+        lastCheckedAt = 0
+    }
+
+    private func clearSaved() {
+        ud.removeObject(forKey: "fxt_newVersion")
+        ud.removeObject(forKey: "fxt_newURL")
+    }
+
+    private func notify(_ title: String, _ text: String) {
+        noticeTitle = title
+        noticeText = text
+        showNotice = true
+    }
+}
+
 struct ContentView: View {
     @AppStorage("fxt_section") private var section = 0
-
-    // 更新检查
-    @AppStorage("fxt_skipVersion") private var skipVersion = ""
-    @AppStorage("fxt_lastUpdateCheck") private var lastUpdateCheck: Double = 0
-    @AppStorage("fxt_newVersion") private var savedNewVersion = ""
-    @AppStorage("fxt_newURL") private var savedNewURL = ""
-    @State private var updateInfo: ReleaseInfo?
-    @State private var showUpdateAlert = false
-    @State private var showNotice = false
-    @State private var noticeTitle = ""
-    @State private var noticeText = ""
-    @State private var checkingUpdate = false
+    @StateObject private var updates = UpdateCenter()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -87,6 +215,7 @@ struct ContentView: View {
                     tabButton("插入封面", icon: "photo.badge.plus", tag: 1)
                     tabButton("结尾处理", icon: "flag.checkered", tag: 2)
                     tabButton("整理归档", icon: "archivebox", tag: 3)
+                    tabButton("关于与更新", icon: "info.circle", tag: 4)
                 }
                 .padding(3)
                 .background(Color(nsColor: .controlBackgroundColor))
@@ -101,74 +230,54 @@ struct ContentView: View {
             .overlay(alignment: .trailing) {
                 updateBadge
                     .padding(.trailing, 20)
-                    .alert(noticeTitle, isPresented: $showNotice) {
+                    .alert(updates.noticeTitle, isPresented: $updates.showNotice) {
                         Button("好") {}
                     } message: {
-                        Text(noticeText)
+                        Text(updates.noticeText)
                     }
             }
 
-            // 四个板块常驻视图树（不销毁）：切换回来时已选文件/日志/预览全部保留
+            // 五个板块常驻视图树（不销毁）：切换回来时已选文件/日志/预览全部保留
             ZStack {
                 sectionLayer(0) { ExtractView() }
                 sectionLayer(1) { InsertCoverView() }
                 sectionLayer(2) { EndingView() }
                 sectionLayer(3) { OrganizerView() }
+                sectionLayer(4) { AboutView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .environmentObject(updates)
         }
-        .frame(minWidth: 780, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
+        .frame(minWidth: 860, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
         .background(Theme.page)
         .preferredColorScheme(nil)
-        .task { startupUpdateCheck() }
+        .task { updates.startupCheck() }
         .onReceive(NotificationCenter.default.publisher(for: .fxtCheckUpdate)) { _ in
-            checkUpdate(manual: true)
+            updates.check(manual: true)
         }
-        .alert("发现新版本 \(updateInfo?.version ?? "")", isPresented: $showUpdateAlert) {
+        .alert("发现新版本 \(updates.found?.version ?? "")", isPresented: $updates.showUpdateAlert) {
             Button("去 GitHub 下载") {
-                if let info = updateInfo { openURL(info.htmlURL) }
+                if let info = updates.found { openURL(info.htmlURL) }
             }
-            Button("跳过此版本") {
-                if let info = updateInfo {
-                    skipVersion = info.version
-                    updateInfo = nil
-                    savedNewVersion = ""
-                }
-            }
+            Button("跳过此版本") { updates.skipCurrent() }
             Button("稍后提醒", role: .cancel) {}
         } message: {
-            Text(updateAlertMessage)
+            Text(updates.updateAlertMessage)
         }
-    }
-
-    private var updateAlertMessage: String {
-        guard let info = updateInfo else { return "" }
-        let current = currentAppVersion()
-        var msg = "当前版本 v\(current)，最新版本 v\(info.version)。"
-        if let name = info.assetName {
-            var size = ""
-            if let bytes = info.assetSize {
-                size = "（\(prettySize(bytes))）"
-            }
-            msg += "\n安装包：\(name)\(size)"
-        }
-        let notes = UpdateCheck.briefNotes(info.notes)
-        if !notes.isEmpty { msg += "\n\n" + notes }
-        return msg
     }
 
     /// 右上角：版本号 / 检查中 / 新版本提示
     @ViewBuilder
     private var updateBadge: some View {
-        if checkingUpdate {
+        if updates.isChecking {
             HStack(spacing: 5) {
                 ProgressView().controlSize(.small).scaleEffect(0.65)
                 Text("检查更新…").font(.system(size: 11))
             }
             .foregroundStyle(.secondary)
-        } else if let info = updateInfo {
+        } else if let info = updates.found {
             Button {
-                showUpdateAlert = true
+                updates.showUpdateAlert = true
             } label: {
                 HStack(spacing: 5) {
                     Image(systemName: "arrow.down.circle.fill").font(.system(size: 11, weight: .semibold))
@@ -183,7 +292,7 @@ struct ContentView: View {
             .help("查看更新内容并前往 GitHub 下载")
         } else {
             Button {
-                checkUpdate(manual: true)
+                updates.check(manual: true)
             } label: {
                 Text("v\(currentAppVersion())")
                     .font(.system(size: 11))
@@ -191,87 +300,6 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .help("当前版本，点击检查更新")
-        }
-    }
-
-    // MARK: 更新检查
-
-    /// 启动时自动检查：距上次检查超过 6 小时才联网
-    private func startupUpdateCheck() {
-        restoreSavedUpdate()
-        let now = Date().timeIntervalSince1970
-        if now - lastUpdateCheck < 6 * 3600 { return }
-        checkUpdate(manual: false)
-    }
-
-    /// 上次发现过的新版本（跨重启仍显示提示）
-    private func restoreSavedUpdate() {
-        let v = savedNewVersion
-        guard !v.isEmpty, v != skipVersion,
-              compareVersion(v, currentAppVersion()) > 0 else {
-            if !v.isEmpty && compareVersion(v, currentAppVersion()) <= 0 {
-                savedNewVersion = ""; savedNewURL = ""
-            }
-            return
-        }
-        var info = ReleaseInfo()
-        info.version = v
-        info.tag = v
-        info.htmlURL = savedNewURL.isEmpty ? UpdateCheck.fallbackURL : savedNewURL
-        updateInfo = info
-    }
-
-    private func checkUpdate(manual: Bool) {
-        guard !checkingUpdate else { return }
-        checkingUpdate = true
-        UpdateCheck.fetchLatest { result in
-            DispatchQueue.main.async {
-                checkingUpdate = false
-                lastUpdateCheck = Date().timeIntervalSince1970
-                switch result {
-                case .failure(let err):
-                    if manual {
-                        noticeTitle = "检查更新失败"
-                        noticeText = err.localizedDescription
-                        showNotice = true
-                    }
-                case .success(let info):
-                    guard let info = info else {
-                        if manual {
-                            noticeTitle = "暂无更新"
-                            noticeText = "仓库还没有发布任何 Release。"
-                            showNotice = true
-                        }
-                        return
-                    }
-                    let current = currentAppVersion()
-                    if compareVersion(info.version, current) > 0 {
-                        if info.version == skipVersion {
-                            savedNewVersion = ""
-                            if manual {
-                                noticeTitle = "已是最新可安装版本"
-                                noticeText = "v\(info.version) 已跳过，当前 v\(current)。"
-                                showNotice = true
-                            }
-                            return
-                        }
-                        updateInfo = info
-                        savedNewVersion = info.version
-                        savedNewURL = info.htmlURL
-                        // 自动检查时才弹窗（手动点击时弹窗也是预期行为）
-                        showUpdateAlert = true
-                    } else {
-                        updateInfo = nil
-                        savedNewVersion = ""
-                        savedNewURL = ""
-                        if manual {
-                            noticeTitle = "已是最新版本"
-                            noticeText = "当前 v\(current)，与 GitHub 上的最新版本一致。"
-                            showNotice = true
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -2226,5 +2254,260 @@ struct OrganizerView: View {
             try? csv.write(to: url, atomically: true, encoding: .utf8)
             logs.append("📄 对照表已导出：\(url.path)")
         }
+    }
+}
+
+// MARK: - 板块 5：关于与更新
+
+struct AboutView: View {
+    @EnvironmentObject private var updates: UpdateCenter
+
+    @State private var ffmpegVer = "检测中…"
+    @State private var ffprobeVer = "检测中…"
+    @State private var notes = ""
+    @State private var notesVersion = ""
+    @State private var loadingNotes = false
+
+    private var appIcon: NSImage {
+        NSApp.applicationIconImage
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                headerCard
+                updateCard
+                notesCard
+                envCard
+                Spacer(minLength: 0)
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .task { probeTools() }
+    }
+
+    // MARK: 应用信息
+
+    private var headerCard: some View {
+        Card {
+            HStack(spacing: 14) {
+                Image(nsImage: appIcon)
+                    .resizable()
+                    .frame(width: 64, height: 64)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .shadow(color: .black.opacity(0.15), radius: 4, y: 1)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Video Post-Production")
+                        .font(.system(size: 17, weight: .bold))
+                    Text("版本 v\(currentAppVersion()) · macOS 13.0+ · Apple Silicon")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Text("视频抽帧 / 插入封面 / 结尾处理 / 整理归档，内置 ffmpeg，开箱即用")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 6) {
+                    Link(destination: URL(string: UpdateCheck.fallbackURL)!) {
+                        Label("GitHub 发布页", systemImage: "arrow.up.right.square")
+                            .font(.system(size: 11.5, weight: .medium))
+                    }
+                    Link(destination: URL(string: "https://github.com/\(UpdateCheck.repoOwner)/\(UpdateCheck.repoName)")!) {
+                        Label("项目仓库", systemImage: "chevron.left.forwardslash.chevron.right")
+                            .font(.system(size: 11.5, weight: .medium))
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: 更新
+
+    private var updateCard: some View {
+        Card {
+            FieldLabel("arrow.triangle.2.circlepath", "更新")
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(updates.found == nil ? Theme.ok : Theme.accent)
+                    .frame(width: 7, height: 7)
+                Text(updates.statusText)
+                    .font(.system(size: 12.5, weight: .medium))
+                Text("·")
+                    .foregroundStyle(.secondary)
+                Text(updates.lastCheckedText)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            HStack(spacing: 10) {
+                Button {
+                    updates.check(manual: true)
+                } label: {
+                    HStack(spacing: 6) {
+                        if updates.isChecking {
+                            ProgressView().controlSize(.small).tint(.white)
+                        } else {
+                            Image(systemName: "magnifyingglass").font(.system(size: 11, weight: .bold))
+                        }
+                        Text(updates.isChecking ? "检查中…" : "检查更新")
+                            .font(.system(size: 12.5, weight: .semibold))
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .foregroundStyle(.white)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(LinearGradient(colors: [Theme.accent, Theme.accentDeep],
+                                                 startPoint: .leading, endPoint: .trailing))
+                            .opacity(updates.isChecking ? 0.4 : 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(updates.isChecking)
+
+                if let info = updates.found {
+                    Button {
+                        if let url = URL(string: info.htmlURL) { NSWorkspace.shared.open(url) }
+                    } label: {
+                        Label("下载 \(info.version)", systemImage: "arrow.down.circle")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Theme.ok.opacity(0.16))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+
+                    Button("跳过此版本") { updates.skipCurrent() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+
+                if !updates.skippedVersion.isEmpty {
+                    Button("恢复更新提示（已跳过 \(updates.skippedVersion)）") {
+                        updates.resetPrompts()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            Text("启动时自动检查一次（6 小时内不重复联网），也可以在菜单栏用 ⌘U 手动检查。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: 最新版本说明
+
+    private var notesCard: some View {
+        Card {
+            HStack {
+                FieldLabel("doc.text", "最新版本说明")
+                Spacer()
+                Button {
+                    loadNotes()
+                } label: {
+                    HStack(spacing: 5) {
+                        if loadingNotes { ProgressView().controlSize(.small) }
+                        Image(systemName: "arrow.clockwise").font(.system(size: 10.5))
+                        Text(loadingNotes ? "加载中…" : "拉取")
+                            .font(.system(size: 11.5, weight: .medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Theme.card)
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+                .disabled(loadingNotes)
+            }
+            if notes.isEmpty {
+                Text(notesVersion.isEmpty ? "点「拉取」查看 GitHub 上最新版本的更新说明。"
+                                          : "（无说明）")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    Text(notes)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 150)
+                .padding(10)
+                .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+
+    // MARK: 运行环境
+
+    private var envCard: some View {
+        Card {
+            FieldLabel("wrench.and.screwdriver", "运行环境")
+            envRow("ffmpeg", ffmpegBin(), ffmpegVer)
+            envRow("ffprobe", ffprobeBin(), ffprobeVer)
+            Text("两个工具都内置在 App 包内，不依赖系统安装的 ffmpeg。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func envRow(_ name: String, _ path: String, _ version: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(name)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(version)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Text(path)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private func loadNotes() {
+        guard !loadingNotes else { return }
+        loadingNotes = true
+        UpdateCheck.fetchLatest { result in
+            DispatchQueue.main.async {
+                loadingNotes = false
+                if case .success(let info) = result, let info = info {
+                    notesVersion = info.version
+                    notes = info.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if notes.isEmpty { notes = "" }
+                } else {
+                    notesVersion = ""
+                    notes = ""
+                }
+            }
+        }
+    }
+
+    private func probeTools() {
+        DispatchQueue.global(qos: .utility).async {
+            let fv = firstLine(of: runTool(ffmpegBin(), ["-version"]).out)
+            let pv = firstLine(of: runTool(ffprobeBin(), ["-version"]).out)
+            DispatchQueue.main.async {
+                ffmpegVer = fv.isEmpty ? "未找到" : fv
+                ffprobeVer = pv.isEmpty ? "未找到" : pv
+            }
+        }
+    }
+
+    private func firstLine(of s: String) -> String {
+        s.split(separator: "\n").first.map(String.init) ?? ""
     }
 }
