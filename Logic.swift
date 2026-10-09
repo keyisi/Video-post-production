@@ -60,7 +60,7 @@ enum UpdateCheck {
     ///   1. Clash 这类 HTTPS 代理会 MITM，URLSession 校验不了它的根证书，
     ///      直接报「A TLS error caused the secure connection to fail」（-1206）；
     ///   2. 代理的共用出口 IP 很容易把 GitHub API 未认证的 60 次/小时配额打满（403）。
-    private static func session(useProxy: Bool, timeout: TimeInterval) -> URLSession {
+    static func session(useProxy: Bool, timeout: TimeInterval) -> URLSession {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = timeout
         cfg.timeoutIntervalForResource = timeout + 5
@@ -220,6 +220,285 @@ enum UpdateCheck {
         }.resume()
     }
 
+    /// 把安装包地址切成「直连 / 走代理」两种尝试顺序
+    static func downloadAttempts(for urlString: String) -> [(String, Bool)] {
+        guard !urlString.isEmpty else { return [] }
+        return [(urlString, false), (urlString, true)]
+    }
+}
+
+// MARK: - App 内更新：下载 → 解压校验 → 替换 → 重启
+
+enum UpdateError: LocalizedError {
+    case noAsset
+    case notNewer(String)
+    case unzipFailed(String)
+    case appNotFound
+    case notWritable(String)
+    case scriptFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noAsset: return "这次 Release 里没有找到可下载的安装包（zip）。"
+        case .notNewer(let v): return "安装包里的版本（\(v)）不比当前新，已取消安装。"
+        case .unzipFailed(let s): return "解压安装包失败：\(s)"
+        case .appNotFound: return "安装包里没有找到 .app。"
+        case .notWritable(let p): return "没有权限替换这个位置的 App：\(p)"
+        case .scriptFailed(let s): return "写入更新脚本失败：\(s)"
+        }
+    }
+}
+
+/// 下载安装包（带进度 + 自动换通道）
+///
+/// 通道顺序和「查版本号」相反 —— **先走系统代理，失败或太慢再直连**：
+/// 实测本机 GitHub Release 附件直连只有 ~24 KB/s（45MB 要半小时），走代理 6.9 MB/s（6.5 秒）；
+/// 而查版本号用的是 API，代理共用出口 IP 容易撞限流，所以那里反过来先直连。
+/// 另外加了「5 秒还没下到 1MB 就换通道」的看门狗，避免卡在慢通道上干等。
+final class UpdateDownloader: NSObject, URLSessionDownloadDelegate {
+    private var session: URLSession?
+    private var dest: URL!
+    private var onProgress: ((Double, Int64, Int64) -> Void)?
+    private var onDone: ((Result<URL, Error>) -> Void)?
+    private var urlString = ""
+    private var modes: [Bool] = []      // true = 走系统代理，false = 直连
+    private var useProxy = true
+    private var finished = false
+    private var switching = false
+    private var received: Int64 = 0
+    private var lastError: Error?
+
+    func start(urlString: String,
+               useProxy: Bool,
+               progress: @escaping (Double, Int64, Int64) -> Void,
+               done: @escaping (Result<URL, Error>) -> Void) {
+        self.urlString = urlString
+        self.onProgress = progress
+        self.onDone = done
+        self.finished = false
+        self.received = 0
+        self.lastError = nil
+        // 优先用调用方给的模式，另一个作为兜底
+        self.modes = useProxy ? [true, false] : [false, true]
+        dest = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("fxt_update_\(UUID().uuidString).zip")
+        next()
+    }
+
+    private func next() {
+        guard !modes.isEmpty else {
+            finish(.failure(lastError ?? UpdateError.noAsset)); return
+        }
+        useProxy = modes.removeFirst()
+        received = 0
+        guard let url = URL(string: urlString) else { finish(.failure(UpdateError.noAsset)); return }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 60
+        cfg.timeoutIntervalForResource = 3600
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        if !useProxy { cfg.connectionProxyDictionary = [:] }
+        var req = URLRequest(url: url, timeoutInterval: 60)
+        req.setValue("Video-Post-Production", forHTTPHeaderField: "User-Agent")
+        let sess = URLSession(configuration: cfg, delegate: self, delegateQueue: .main)
+        self.session = sess
+        sess.downloadTask(with: req).resume()
+
+        // 看门狗：5 秒还不到 1MB（≈200KB/s）就判定这条通道太慢，换另一条
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self = self, !self.finished else { return }
+            if self.received < 1_000_000 { self.switchChannel() }
+        }
+    }
+
+    private func switchChannel() {
+        guard !modes.isEmpty, !finished else { return }
+        switching = true
+        session?.invalidateAndCancel()
+    }
+
+    private func finish(_ r: Result<URL, Error>) {
+        guard !finished else { return }
+        finished = true
+        session?.finishTasksAndInvalidate()
+        DispatchQueue.main.async { self.onDone?(r) }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        received = totalBytesWritten
+        guard totalBytesExpectedToWrite > 0 else { return }
+        DispatchQueue.main.async {
+            self.onProgress?(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite),
+                             totalBytesWritten, totalBytesExpectedToWrite)
+        }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        try? FileManager.default.removeItem(at: dest)
+        do {
+            try FileManager.default.moveItem(at: location, to: dest)
+        } catch {
+            finish(.failure(error))
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if switching {
+            // 自己取消的（换通道），不算失败
+            switching = false
+            next()
+            return
+        }
+        if let error = error {
+            lastError = error
+            if !modes.isEmpty { next(); return }
+            finish(.failure(error))
+            return
+        }
+        guard let d = dest, FileManager.default.fileExists(atPath: d.path) else {
+            lastError = UpdateError.noAsset
+            if !modes.isEmpty { next(); return }
+            finish(.failure(UpdateError.noAsset))
+            return
+        }
+        finish(.success(d))
+    }
+}
+
+/// 解压 + 校验 + 生成自替换脚本（App 退出后由脚本完成替换并重新打开）
+enum UpdateInstall {
+    /// 解压 zip，返回里面的 .app 路径
+    static func unzip(_ zip: URL) throws -> URL {
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("fxt_unzip_\(UUID().uuidString)")
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        p.arguments = ["-x", "-k", "--sequesterRsrc", zip.path, dir.path]
+        let err = Pipe()
+        p.standardError = err
+        try p.run()
+        p.waitUntilExit()
+        if p.terminationStatus != 0 {
+            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw UpdateError.unzipFailed(msg.isEmpty ? "ditto 退出码 \(p.terminationStatus)" : msg)
+        }
+        guard let app = findApp(in: dir) else { throw UpdateError.appNotFound }
+        return app
+    }
+
+    static func findApp(in dir: URL) -> URL? {
+        let fm = FileManager.default
+        guard let e = fm.enumerator(at: dir, includingPropertiesForKeys: [.isDirectoryKey]) else { return nil }
+        while let u = e.nextObject() as? URL {
+            if u.pathExtension == "app" {
+                var isDir: ObjCBool = false
+                if fm.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue { return u }
+            }
+        }
+        return nil
+    }
+
+    /// 读某个 .app 的版本号
+    static func version(ofApp app: URL) -> String {
+        let plist = app.appendingPathComponent("Contents/Info.plist")
+        guard let d = NSDictionary(contentsOf: plist),
+              let v = d["CFBundleShortVersionString"] as? String else { return "" }
+        return v
+    }
+
+    /// 新 App 必须：版本更新 + 内置 ffmpeg 还在（防止下到残缺包）
+    static func validate(newApp: URL, currentVersion: String) throws {
+        let v = version(ofApp: newApp)
+        guard !v.isEmpty, compareVersion(v, currentVersion) > 0 else {
+            throw UpdateError.notNewer(v.isEmpty ? "未知" : v)
+        }
+        let ff = newApp.appendingPathComponent("Contents/Resources/ffmpeg")
+        guard FileManager.default.fileExists(atPath: ff.path) else {
+            throw UpdateError.unzipFailed("安装包里缺少内置 ffmpeg，可能是残缺文件")
+        }
+    }
+
+    /// 当前 App 所在目录是否可写（/Applications 这类 root 目录通常不可写 → 走管理员授权）
+    static func parentWritable(_ app: URL) -> Bool {
+        let parent = app.deletingLastPathComponent()
+        return FileManager.default.isWritableFile(atPath: parent.path)
+    }
+
+    /// 生成替换脚本并**脱离 App 进程**启动：等 App 退出 → 备份旧版 → 换新 → 去隔离 → 重新打开
+    /// - `quit` 由调用方（App 层）提供，脚本启动后才退出自身
+    static func installAndRelaunch(newApp: URL,
+                                   targetApp: URL,
+                                   quit: @escaping () -> Void) throws {
+        let fm = FileManager.default
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let needAdmin = !parentWritable(targetApp)
+        if needAdmin {
+            // /Applications 等受保护目录：先看看能不能走管理员授权（用户取消则失败）
+            if !fm.isWritableFile(atPath: targetApp.path) &&
+               !fm.isWritableFile(atPath: targetApp.deletingLastPathComponent().path) {
+                // 脚本里会用管理员权限执行，这里不直接判定失败
+            }
+        }
+        let script = """
+        #!/bin/sh
+        NEW="\(newApp.path)"
+        TARGET="\(targetApp.path)"
+        PID=\(pid)
+        BAK="$(dirname "$TARGET")/.VideoPostProduction.old.app"
+        i=0
+        while kill -0 "$PID" 2>/dev/null && [ $i -lt 300 ]; do
+          sleep 0.2
+          i=$((i+1))
+        done
+        sleep 1
+        rm -rf "$BAK" 2>/dev/null
+        if mv "$TARGET" "$BAK" 2>/dev/null; then
+          :
+        else
+          rm -rf "$TARGET" 2>/dev/null
+        fi
+        if mv "$NEW" "$TARGET" 2>/dev/null; then
+          xattr -dr com.apple.quarantine "$TARGET" 2>/dev/null
+          rm -rf "$BAK" 2>/dev/null
+          open -a "$TARGET"
+        else
+          # 失败就回滚，别把用户原来的 App 弄没了
+          if [ -d "$BAK" ]; then mv "$BAK" "$TARGET" 2>/dev/null; fi
+          exit 1
+        fi
+        """
+        let scriptURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("fxt_update_\(pid).sh")
+        do {
+            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        } catch {
+            throw UpdateError.scriptFailed(error.localizedDescription)
+        }
+        let launcher = Process()
+        launcher.executableURL = URL(fileURLWithPath: "/bin/sh")
+        if needAdmin {
+            // 管理员授权：弹出系统密码框，App 退出后由它完成替换
+            let osa = "do shell script \"/bin/sh '\(scriptURL.path)'\" with administrator privileges"
+            launcher.arguments = ["-c", "nohup /usr/bin/osascript -e '\(osa)' >/tmp/fxt_update.log 2>&1 &"]
+        } else {
+            launcher.arguments = ["-c", "nohup /bin/sh '\(scriptURL.path)' >/tmp/fxt_update.log 2>&1 &"]
+        }
+        do {
+            try launcher.run()
+        } catch {
+            throw UpdateError.scriptFailed(error.localizedDescription)
+        }
+        DispatchQueue.main.async { quit() }
+    }
+}
+
+extension UpdateCheck {
     private static func textBetween(_ s: String, start: String, end: String) -> String {
         guard let a = s.range(of: start),
               let b = s.range(of: end, range: a.upperBound..<s.endIndex) else { return "" }

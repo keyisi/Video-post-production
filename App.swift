@@ -62,6 +62,11 @@ extension Notification.Name {
     static let fxtCheckUpdate = Notification.Name("fxtCheckUpdate")
 }
 
+/// App 内更新的阶段
+enum UpdatePhase {
+    case idle, downloading, installing
+}
+
 /// 更新检查中心：顶栏徽章与「关于与更新」板块共用同一份状态
 final class UpdateCenter: ObservableObject {
     @Published private(set) var isChecking = false
@@ -75,6 +80,12 @@ final class UpdateCenter: ObservableObject {
     @Published var showUpdateAlert = false
     /// 通知弹窗里是否提供「打开 GitHub 发布页」（网络失败时有）
     @Published private(set) var noticeCanOpenWeb = false
+
+    // MARK: App 内更新（下载 → 替换 → 重启）
+    @Published private(set) var phase: UpdatePhase = .idle
+    @Published private(set) var downloadFraction: Double = 0
+    @Published private(set) var downloadText = ""
+    private var downloader: UpdateDownloader?
 
     private let ud = UserDefaults.standard
 
@@ -212,6 +223,59 @@ final class UpdateCenter: ObservableObject {
     func openReleasesPage() {
         if let url = URL(string: UpdateCheck.fallbackURL) { NSWorkspace.shared.open(url) }
     }
+
+    // MARK: App 内一键更新
+
+    var isBusyUpdating: Bool { phase != .idle }
+
+    /// 下载最新安装包 → 解压校验 → 生成脚本替换自身并重启
+    /// - `quit` 由视图层传入（一般是 `NSApp.terminate(nil)`）
+    func installUpdate(quit: @escaping () -> Void) {
+        guard !isBusyUpdating else { return }
+        guard let info = found, let url = info.assetURL, !url.isEmpty else {
+            notify("无法自动更新",
+                   "这次 Release 里没有找到 zip 安装包，请到 GitHub 发布页手动下载（dmg 也可以）。",
+                   canOpenWeb: true)
+            return
+        }
+        phase = .downloading
+        downloadFraction = 0
+        downloadText = "开始下载…"
+
+        downloader = UpdateDownloader()
+        // 下载优先走系统代理（本机实测直连只有 24KB/s、代理 6.9MB/s），失败/太慢会自动换直连
+        downloader?.start(urlString: url, useProxy: true,
+                          progress: { [weak self] f, got, total in
+            guard let self = self else { return }
+            self.downloadFraction = f
+            self.downloadText = "\(prettySize(got)) / \(prettySize(total))"
+        }, done: { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let err):
+                self.phase = .idle
+                self.notify("下载失败", err.localizedDescription, canOpenWeb: true)
+            case .success(let zip):
+                self.phase = .installing
+                self.downloadText = "解压并校验安装包…"
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        let newApp = try UpdateInstall.unzip(zip)
+                        try UpdateInstall.validate(newApp: newApp,
+                                                   currentVersion: currentAppVersion())
+                        try UpdateInstall.installAndRelaunch(newApp: newApp,
+                                                             targetApp: Bundle.main.bundleURL,
+                                                             quit: quit)
+                    } catch {
+                        DispatchQueue.main.async {
+                            self.phase = .idle
+                            self.notify("更新失败", error.localizedDescription, canOpenWeb: true)
+                        }
+                    }
+                }
+            }
+        })
+    }
 }
 
 struct ContentView: View {
@@ -243,7 +307,10 @@ struct ContentView: View {
             updates.check(manual: true)
         }
         .alert("发现新版本 \(updates.found?.version ?? "")", isPresented: $updates.showUpdateAlert) {
-            Button("去 GitHub 下载") {
+            Button("下载并安装") {
+                updates.installUpdate { NSApp.terminate(nil) }
+            }
+            Button("去网页下载") {
                 if let info = updates.found { openURL(info.htmlURL) }
             }
             Button("跳过此版本") { updates.skipCurrent() }
@@ -2412,15 +2479,42 @@ struct AboutView: View {
                 .disabled(updates.isChecking)
 
                 if let info = updates.found {
+                    // 一键更新：下载 → 替换 → 自动重启
+                    Button {
+                        updates.installUpdate { NSApp.terminate(nil) }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 11, weight: .bold))
+                            Text(updates.phase == .downloading ? "下载中…"
+                                 : updates.phase == .installing ? "安装中…"
+                                 : "安装更新 \(info.version)")
+                                .font(.system(size: 12.5, weight: .semibold))
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .foregroundStyle(.white)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Theme.ok)
+                                .opacity(updates.isBusyUpdating ? 0.5 : 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(updates.isBusyUpdating)
+                    .help("下载安装包并自动替换当前 App，完成后会自动重新打开")
+
                     Button {
                         if let url = URL(string: info.htmlURL) { NSWorkspace.shared.open(url) }
                     } label: {
-                        Label("下载 \(info.version)", systemImage: "arrow.down.circle")
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .padding(.horizontal, 14)
+                        Label("打开发布页", systemImage: "safari")
+                            .font(.system(size: 12))
+                            .padding(.horizontal, 12)
                             .padding(.vertical, 8)
-                            .background(Theme.ok.opacity(0.16))
+                            .background(Theme.card)
                             .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .overlay(RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.primary.opacity(0.12)))
                     }
                     .buttonStyle(.plain)
 
@@ -2428,6 +2522,7 @@ struct AboutView: View {
                         .buttonStyle(.plain)
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
+                        .disabled(updates.isBusyUpdating)
                 }
 
                 if !updates.skippedVersion.isEmpty {
@@ -2440,7 +2535,29 @@ struct AboutView: View {
                 }
                 Spacer()
             }
-            Text("启动时自动检查一次（6 小时内不重复联网），也可以在菜单栏用 ⌘U 手动检查。")
+            if updates.phase == .downloading {
+                HStack(spacing: 8) {
+                    ProgressView(value: max(0, min(1, updates.downloadFraction)))
+                        .progressViewStyle(.linear)
+                        .frame(width: 220)
+                    Text("\(Int(updates.downloadFraction * 100))%")
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Text(updates.downloadText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            } else if updates.phase == .installing {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在安装，App 会自动退出并重新打开…")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+            Text("启动时自动检查一次（6 小时内不重复联网），也可以在菜单栏用 ⌘U 手动检查；发现新版本后可一键下载安装并自动重启。")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
         }
