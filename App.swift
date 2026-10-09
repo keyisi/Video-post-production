@@ -69,8 +69,12 @@ final class UpdateCenter: ObservableObject {
     @Published private(set) var noticeTitle = ""
     @Published private(set) var noticeText = ""
     @Published private(set) var lastCheckedAt: Double = 0
+    /// 本次更新信息走的是哪条通道（界面上展示，便于排查代理/TLS 问题）
+    @Published private(set) var lastSource = ""
     @Published var showNotice = false
     @Published var showUpdateAlert = false
+    /// 通知弹窗里是否提供「打开 GitHub 发布页」（网络失败时有）
+    @Published private(set) var noticeCanOpenWeb = false
 
     private let ud = UserDefaults.standard
 
@@ -92,12 +96,12 @@ final class UpdateCenter: ObservableObject {
     var statusText: String {
         if isChecking { return "正在检查…" }
         if let info = found { return "发现新版本 \(info.version)" }
-        return "已是最新版本 v\(currentAppVersion())"
+        return "已是最新版本 \(displayVersion(currentAppVersion()))"
     }
 
     var updateAlertMessage: String {
         guard let info = found else { return "" }
-        var msg = "当前版本 v\(currentAppVersion())，最新版本 v\(info.version)。"
+        var msg = "当前版本 \(displayVersion(currentAppVersion()))，最新版本 \(displayVersion(info.version))。"
         if let name = info.assetName {
             var size = ""
             if let bytes = info.assetSize { size = "（\(prettySize(bytes))）" }
@@ -142,19 +146,23 @@ final class UpdateCenter: ObservableObject {
                 self.ud.set(self.lastCheckedAt, forKey: "fxt_lastUpdateCheck")
                 switch result {
                 case .failure(let err):
-                    if manual { self.notify("检查更新失败", err.localizedDescription) }
+                    self.lastSource = "全部通道均失败"
+                    if manual {
+                        self.notify("检查更新失败", err.localizedDescription, canOpenWeb: true)
+                    }
                 case .success(let info):
                     guard let info = info else {
                         if manual { self.notify("暂无更新", "仓库还没有发布任何 Release。") }
                         return
                     }
+                    self.lastSource = info.source
                     let current = currentAppVersion()
                     if compareVersion(info.version, current) > 0 {
                         if info.version == self.skippedVersion {
                             self.clearSaved()
                             if manual {
                                 self.notify("已是最新可安装版本",
-                                            "v\(info.version) 已跳过，当前 v\(current)。")
+                                            "\(displayVersion(info.version)) 已跳过，当前 \(displayVersion(current))。")
                             }
                             return
                         }
@@ -194,10 +202,15 @@ final class UpdateCenter: ObservableObject {
         ud.removeObject(forKey: "fxt_newURL")
     }
 
-    private func notify(_ title: String, _ text: String) {
+    private func notify(_ title: String, _ text: String, canOpenWeb: Bool = false) {
         noticeTitle = title
         noticeText = text
+        noticeCanOpenWeb = canOpenWeb
         showNotice = true
+    }
+
+    func openReleasesPage() {
+        if let url = URL(string: UpdateCheck.fallbackURL) { NSWorkspace.shared.open(url) }
     }
 }
 
@@ -263,7 +276,12 @@ struct ContentView: View {
                 .padding(.horizontal, 14)
                 .padding(.bottom, 14)
                 .alert(updates.noticeTitle, isPresented: $updates.showNotice) {
-                    Button("好") {}
+                    if updates.noticeCanOpenWeb {
+                        Button("打开 GitHub 发布页") { updates.openReleasesPage() }
+                        Button("好", role: .cancel) {}
+                    } else {
+                        Button("好") {}
+                    }
                 } message: {
                     Text(updates.noticeText)
                 }
@@ -334,7 +352,7 @@ struct ContentView: View {
             Button {
                 updates.check(manual: true)
             } label: {
-                Text("v\(currentAppVersion())")
+                Text(displayVersion(currentAppVersion()))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -2319,7 +2337,7 @@ struct AboutView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Video Post-Production")
                         .font(.system(size: 17, weight: .bold))
-                    Text("版本 v\(currentAppVersion()) · macOS 13.0+ · Apple Silicon")
+                    Text("版本 \(displayVersion(currentAppVersion())) · macOS 13.0+ · Apple Silicon")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                     Text("视频抽帧 / 插入封面 / 结尾处理 / 整理归档，内置 ffmpeg，开箱即用")
@@ -2357,6 +2375,14 @@ struct AboutView: View {
                 Text(updates.lastCheckedText)
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
+                if !updates.lastSource.isEmpty {
+                    Text("·")
+                        .foregroundStyle(.secondary)
+                    Text(updates.lastSource)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                        .help("本次更新信息走通的通道，用于排查代理/TLS 问题")
+                }
                 Spacer()
             }
             HStack(spacing: 10) {

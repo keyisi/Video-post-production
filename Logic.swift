@@ -12,11 +12,20 @@ struct ReleaseInfo {
     var assetName: String?
     var assetURL: String?
     var assetSize: Int64?
+    /// 这次信息是走哪条通道拿到的（界面上展示，便于排查网络问题）
+    var source: String = ""
 }
 
 /// 当前 App 版本（Info.plist 的 CFBundleShortVersionString）
 func currentAppVersion() -> String {
     (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0"
+}
+
+/// 统一成「v3.15.0」这种展示格式：版本号本身可能带也可能不带 v 前缀（GitHub tag 通常带）
+func displayVersion(_ s: String) -> String {
+    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    if t.isEmpty { return t }
+    return t.lowercased().hasPrefix("v") ? t : "v" + t
 }
 
 /// 逐段数字比较版本号：a > b 返回 1，相等返回 0，a < b 返回 -1
@@ -155,6 +164,7 @@ enum UpdateCheck {
             info.version = tag
             info.htmlURL = (dict["html_url"] as? String) ?? fallbackURL
             info.notes = (dict["body"] as? String) ?? ""
+            info.source = useProxy ? "GitHub API · 系统代理" : "GitHub API · 直连"
             if let assets = dict["assets"] as? [[String: Any]] {
                 let zipAsset = assets.first { (($0["name"] as? String) ?? "").lowercased().hasSuffix(".zip") }
                 if let z = zipAsset {
@@ -205,6 +215,7 @@ enum UpdateCheck {
             info.version = title
             info.htmlURL = html.isEmpty ? fallbackURL : html
             info.notes = ""
+            info.source = useProxy ? "releases.atom · 系统代理" : "releases.atom · 直连"
             completion(info, nil)
         }.resume()
     }
