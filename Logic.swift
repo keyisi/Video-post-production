@@ -45,29 +45,78 @@ enum UpdateCheck {
     /// API 兜底通道：releases.atom 不占 API 限流额度
     static let atomURL = "https://github.com/\(repoOwner)/\(repoName)/releases.atom"
 
+    /// 建一个更新检查用的 session
+    /// - `useProxy = false` 时清空 connectionProxyDictionary → **绕过系统代理直连**。
+    ///   必须这么做的两个理由：
+    ///   1. Clash 这类 HTTPS 代理会 MITM，URLSession 校验不了它的根证书，
+    ///      直接报「A TLS error caused the secure connection to fail」（-1206）；
+    ///   2. 代理的共用出口 IP 很容易把 GitHub API 未认证的 60 次/小时配额打满（403）。
+    private static func session(useProxy: Bool, timeout: TimeInterval) -> URLSession {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = timeout
+        cfg.timeoutIntervalForResource = timeout + 5
+        cfg.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        if !useProxy { cfg.connectionProxyDictionary = [:] }
+        return URLSession(configuration: cfg)
+    }
+
     /// 拉取 GitHub 最新 Release（只认 latest，草稿/预发布不算）
-    /// - 优先走 API；API 限流/失败时自动走 releases.atom 兜底
+    /// 四级兜底链：API 直连 → API 走代理 → atom 直连 → atom 走代理
     /// - 成功但仓库还没有 Release → .success(nil)
-    static func fetchLatest(timeout: TimeInterval = 12,
+    static func fetchLatest(timeout: TimeInterval = 10,
                             completion: @escaping (Result<ReleaseInfo?, Error>) -> Void) {
-        fetchFromAPI(timeout: timeout) { result in
-            switch result {
-            case .success(let info):
-                completion(.success(info))
-            case .failure(let err):
+        let per = min(timeout, 8)
+        var lastErr: Error?
+
+        fetchFromAPI(timeout: per, useProxy: false) { r in
+            if case .success(let info) = r { completion(.success(info)); return }
+            if case .failure(let e) = r { lastErr = e }
+
+            fetchFromAPI(timeout: per, useProxy: true) { r2 in
+                if case .success(let info) = r2 { completion(.success(info)); return }
+                if case .failure(let e) = r2 { lastErr = e }
+
                 // API 限流是常态（未认证 60 次/小时，共用出口 IP 容易撞上），改走 atom
-                fetchFromAtom(timeout: timeout) { info, atomErr in
-                    if let info = info {
-                        completion(.success(info))
-                    } else {
-                        completion(.failure(atomErr ?? err))
+                fetchFromAtom(timeout: per, useProxy: false) { info3, e3 in
+                    if let info3 = info3 { completion(.success(info3)); return }
+                    if let e3 = e3 { lastErr = e3 }
+
+                    fetchFromAtom(timeout: per, useProxy: true) { info4, e4 in
+                        if let info4 = info4 { completion(.success(info4)); return }
+                        if let e4 = e4 { lastErr = e4 }
+                        completion(.failure(friendlyError(lastErr)))
                     }
                 }
             }
         }
     }
 
+    /// 把系统级的网络报错翻译成人话（弹窗直接显示 localizedDescription）
+    private static func friendlyError(_ err: Error?) -> Error {
+        guard let err = err else {
+            return NSError(domain: "Update", code: -9,
+                           userInfo: [NSLocalizedDescriptionKey: "暂时拿不到更新信息，请稍后再试。"])
+        }
+        let ns = err as NSError
+        guard ns.domain == NSURLErrorDomain else { return err }
+        if (-1210..<(-1199)).contains(ns.code) {
+            return NSError(domain: "Update", code: ns.code,
+                           userInfo: [NSLocalizedDescriptionKey:
+                            "HTTPS 握手失败（错误 \(ns.code)），通常是代理/VPN 的中间证书没被信任。已尝试绕过系统代理重试仍未成功，可点「GitHub 发布页」手动查看。"])
+        }
+        if ns.code == NSURLErrorTimedOut {
+            return NSError(domain: "Update", code: ns.code,
+                           userInfo: [NSLocalizedDescriptionKey: "连接超时：网络到 GitHub 不通，或需要可用的代理。"])
+        }
+        if ns.code == NSURLErrorNotConnectedToInternet {
+            return NSError(domain: "Update", code: ns.code,
+                           userInfo: [NSLocalizedDescriptionKey: "当前没有网络连接。"])
+        }
+        return err
+    }
+
     private static func fetchFromAPI(timeout: TimeInterval,
+                                     useProxy: Bool,
                                      completion: @escaping (Result<ReleaseInfo?, Error>) -> Void) {
         guard let url = URL(string: apiURL) else {
             completion(.failure(NSError(domain: "Update", code: -2,
@@ -80,7 +129,9 @@ enum UpdateCheck {
         req.setValue("Video-Post-Production", forHTTPHeaderField: "User-Agent")
         req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
 
-        URLSession.shared.dataTask(with: req) { data, response, error in
+        let sess = session(useProxy: useProxy, timeout: timeout)
+        sess.dataTask(with: req) { data, response, error in
+            defer { sess.finishTasksAndInvalidate() }
             if let error = error {
                 completion(.failure(error)); return
             }
@@ -118,12 +169,15 @@ enum UpdateCheck {
 
     /// 兜底：解析 https://github.com/…/releases.atom 的第一条 entry
     private static func fetchFromAtom(timeout: TimeInterval,
+                                      useProxy: Bool,
                                       completion: @escaping (ReleaseInfo?, Error?) -> Void) {
         guard let url = URL(string: atomURL) else { completion(nil, nil); return }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.setValue("Video-Post-Production", forHTTPHeaderField: "User-Agent")
         req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        URLSession.shared.dataTask(with: req) { data, _, error in
+        let sess = session(useProxy: useProxy, timeout: timeout)
+        sess.dataTask(with: req) { data, _, error in
+            defer { sess.finishTasksAndInvalidate() }
             if let error = error { completion(nil, error); return }
             guard let data = data, let xml = String(data: data, encoding: .utf8) else {
                 completion(nil, NSError(domain: "Update", code: -4,

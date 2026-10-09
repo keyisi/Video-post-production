@@ -2,7 +2,7 @@
 
 一款为短剧/批量视频后期处理打造的 macOS 原生工具（SwiftUI + 内置 ffmpeg），把「抽帧、封面、结尾效果、整理归档」四件事装进一个 App。
 
-![Version](https://img.shields.io/badge/version-3.16.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
+![Version](https://img.shields.io/badge/version-3.16.3-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
 
 ![Release](https://img.shields.io/badge/release-latest-green)
 
@@ -16,7 +16,7 @@
 
 ### 0. 自动更新检查
 
-- 启动时自动检查 GitHub Releases（6 小时内不重复联网；API 限流时自动走 `releases.atom` 兜底）
+- 启动时自动检查 GitHub Releases（6 小时内不重复联网）；联网走四级兜底「API 直连 → API 走代理 → `releases.atom` 直连 → atom 走代理」，绕开 MITM 代理的 TLS 拦截与 API 限流
 - 发现新版本：右上角出现「新版本 vX.Y.Z」提示 + 弹窗（含更新说明与安装包信息），一键打开 GitHub 下载页；可「跳过此版本」
 - 手动检查：点右上角版本号，或菜单栏「检查更新…」（⌘U）
 
@@ -128,6 +128,6 @@ swiftc -disable-sandbox -O main.swift Logic.swift -o build/videopost-cli
 - 设置通过 `@AppStorage`（UserDefaults，键前缀 `fxt_`）持久化，重开 App 自动恢复
 - 内置 ffmpeg 定位优先级：App 包内 Resources → `~/.local/bin` → `/opt/homebrew/bin` 等系统路径
 - 进度来自 ffmpeg `-progress pipe:1` 的 `out_time_us` 实时解析，不是估算
-- 更新检查走 GitHub API `/releases/latest`，被限流时降级到 `releases.atom`；版本号逐段数字比较，发现新版写入 `@AppStorage`（`fxt_newVersion`），跨重启仍显示提示
+- 更新检查走 GitHub API `/releases/latest`，限流或被代理 MITM 拦截时逐级降级到 `releases.atom`；先尝试 `connectionProxyDictionary = [:]` 直连（避开代理证书与共用 IP 限流），失败再走系统代理；版本号逐段数字比较，发现新版写入 `@AppStorage`（`fxt_newVersion`），跨重启仍显示提示
 - 停止处理通过全局 `RunControl` 终止进程（`terminate` + 0.5s 后 `SIGKILL` 兜底）
 - 重命名防呆护栏：模板不含 `{扩展名}` 时自动补全；计划内重名目标会被标红并阻止执行
