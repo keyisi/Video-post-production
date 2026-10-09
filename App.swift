@@ -39,16 +39,47 @@ struct FrameToolApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 880, height: 700)
         .windowResizability(.contentMinSize)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Button("检查更新…") {
+                    NotificationCenter.default.post(name: .fxtCheckUpdate, object: nil)
+                }
+                .keyboardShortcut("u", modifiers: .command)
+                Button("打开 GitHub 发布页") {
+                    if let url = URL(string: UpdateCheck.fallbackURL) {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+        }
     }
 }
 
 // MARK: - 根视图
+
+extension Notification.Name {
+    /// 菜单里的「检查更新」触发
+    static let fxtCheckUpdate = Notification.Name("fxtCheckUpdate")
+}
+
 struct ContentView: View {
     @AppStorage("fxt_section") private var section = 0
 
+    // 更新检查
+    @AppStorage("fxt_skipVersion") private var skipVersion = ""
+    @AppStorage("fxt_lastUpdateCheck") private var lastUpdateCheck: Double = 0
+    @AppStorage("fxt_newVersion") private var savedNewVersion = ""
+    @AppStorage("fxt_newURL") private var savedNewURL = ""
+    @State private var updateInfo: ReleaseInfo?
+    @State private var showUpdateAlert = false
+    @State private var showNotice = false
+    @State private var noticeTitle = ""
+    @State private var noticeText = ""
+    @State private var checkingUpdate = false
+
     var body: some View {
         VStack(spacing: 0) {
-            // 顶栏: 板块切换
+            // 顶栏: 板块切换 + 右侧版本/更新提示
             HStack {
                 Spacer()
                 HStack(spacing: 2) {
@@ -67,6 +98,15 @@ struct ContentView: View {
             .padding(.horizontal, 20)
             .padding(.top, 14)
             .padding(.bottom, 12)
+            .overlay(alignment: .trailing) {
+                updateBadge
+                    .padding(.trailing, 20)
+                    .alert(noticeTitle, isPresented: $showNotice) {
+                        Button("好") {}
+                    } message: {
+                        Text(noticeText)
+                    }
+            }
 
             // 四个板块常驻视图树（不销毁）：切换回来时已选文件/日志/预览全部保留
             ZStack {
@@ -80,6 +120,164 @@ struct ContentView: View {
         .frame(minWidth: 780, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
         .background(Theme.page)
         .preferredColorScheme(nil)
+        .task { startupUpdateCheck() }
+        .onReceive(NotificationCenter.default.publisher(for: .fxtCheckUpdate)) { _ in
+            checkUpdate(manual: true)
+        }
+        .alert("发现新版本 \(updateInfo?.version ?? "")", isPresented: $showUpdateAlert) {
+            Button("去 GitHub 下载") {
+                if let info = updateInfo { openURL(info.htmlURL) }
+            }
+            Button("跳过此版本") {
+                if let info = updateInfo {
+                    skipVersion = info.version
+                    updateInfo = nil
+                    savedNewVersion = ""
+                }
+            }
+            Button("稍后提醒", role: .cancel) {}
+        } message: {
+            Text(updateAlertMessage)
+        }
+    }
+
+    private var updateAlertMessage: String {
+        guard let info = updateInfo else { return "" }
+        let current = currentAppVersion()
+        var msg = "当前版本 v\(current)，最新版本 v\(info.version)。"
+        if let name = info.assetName {
+            var size = ""
+            if let bytes = info.assetSize {
+                size = "（\(prettySize(bytes))）"
+            }
+            msg += "\n安装包：\(name)\(size)"
+        }
+        let notes = UpdateCheck.briefNotes(info.notes)
+        if !notes.isEmpty { msg += "\n\n" + notes }
+        return msg
+    }
+
+    /// 右上角：版本号 / 检查中 / 新版本提示
+    @ViewBuilder
+    private var updateBadge: some View {
+        if checkingUpdate {
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.small).scaleEffect(0.65)
+                Text("检查更新…").font(.system(size: 11))
+            }
+            .foregroundStyle(.secondary)
+        } else if let info = updateInfo {
+            Button {
+                showUpdateAlert = true
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.down.circle.fill").font(.system(size: 11, weight: .semibold))
+                    Text("新版本 \(info.version)").font(.system(size: 11.5, weight: .semibold))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Theme.accent))
+            }
+            .buttonStyle(.plain)
+            .help("查看更新内容并前往 GitHub 下载")
+        } else {
+            Button {
+                checkUpdate(manual: true)
+            } label: {
+                Text("v\(currentAppVersion())")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("当前版本，点击检查更新")
+        }
+    }
+
+    // MARK: 更新检查
+
+    /// 启动时自动检查：距上次检查超过 6 小时才联网
+    private func startupUpdateCheck() {
+        restoreSavedUpdate()
+        let now = Date().timeIntervalSince1970
+        if now - lastUpdateCheck < 6 * 3600 { return }
+        checkUpdate(manual: false)
+    }
+
+    /// 上次发现过的新版本（跨重启仍显示提示）
+    private func restoreSavedUpdate() {
+        let v = savedNewVersion
+        guard !v.isEmpty, v != skipVersion,
+              compareVersion(v, currentAppVersion()) > 0 else {
+            if !v.isEmpty && compareVersion(v, currentAppVersion()) <= 0 {
+                savedNewVersion = ""; savedNewURL = ""
+            }
+            return
+        }
+        var info = ReleaseInfo()
+        info.version = v
+        info.tag = v
+        info.htmlURL = savedNewURL.isEmpty ? UpdateCheck.fallbackURL : savedNewURL
+        updateInfo = info
+    }
+
+    private func checkUpdate(manual: Bool) {
+        guard !checkingUpdate else { return }
+        checkingUpdate = true
+        UpdateCheck.fetchLatest { result in
+            DispatchQueue.main.async {
+                checkingUpdate = false
+                lastUpdateCheck = Date().timeIntervalSince1970
+                switch result {
+                case .failure(let err):
+                    if manual {
+                        noticeTitle = "检查更新失败"
+                        noticeText = err.localizedDescription
+                        showNotice = true
+                    }
+                case .success(let info):
+                    guard let info = info else {
+                        if manual {
+                            noticeTitle = "暂无更新"
+                            noticeText = "仓库还没有发布任何 Release。"
+                            showNotice = true
+                        }
+                        return
+                    }
+                    let current = currentAppVersion()
+                    if compareVersion(info.version, current) > 0 {
+                        if info.version == skipVersion {
+                            savedNewVersion = ""
+                            if manual {
+                                noticeTitle = "已是最新可安装版本"
+                                noticeText = "v\(info.version) 已跳过，当前 v\(current)。"
+                                showNotice = true
+                            }
+                            return
+                        }
+                        updateInfo = info
+                        savedNewVersion = info.version
+                        savedNewURL = info.htmlURL
+                        // 自动检查时才弹窗（手动点击时弹窗也是预期行为）
+                        showUpdateAlert = true
+                    } else {
+                        updateInfo = nil
+                        savedNewVersion = ""
+                        savedNewURL = ""
+                        if manual {
+                            noticeTitle = "已是最新版本"
+                            noticeText = "当前 v\(current)，与 GitHub 上的最新版本一致。"
+                            showNotice = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func openURL(_ string: String) {
+        guard let url = URL(string: string) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     /// 板块图层：非当前板块只隐藏、不销毁，保证 @State（列表/日志/预览）不丢

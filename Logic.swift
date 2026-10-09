@@ -2,6 +2,180 @@ import Foundation
 // Video Post-Production 逻辑层 —— ffmpeg 版（零 AVFoundation 依赖）
 // 需要 ffmpeg + ffprobe（依次查找 ~/.local/bin、/opt/homebrew/bin、/usr/local/bin、/usr/bin）
 
+// MARK: - 版本更新检查（GitHub Releases）
+
+struct ReleaseInfo {
+    var tag: String = ""
+    var version: String = ""
+    var htmlURL: String = ""
+    var notes: String = ""
+    var assetName: String?
+    var assetURL: String?
+    var assetSize: Int64?
+}
+
+/// 当前 App 版本（Info.plist 的 CFBundleShortVersionString）
+func currentAppVersion() -> String {
+    (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.0.0"
+}
+
+/// 逐段数字比较版本号：a > b 返回 1，相等返回 0，a < b 返回 -1
+func compareVersion(_ a: String, _ b: String) -> Int {
+    func parts(_ s: String) -> [Int] {
+        var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.lowercased().hasPrefix("v") { t = String(t.dropFirst()) }
+        return t.split(separator: ".").map { Int(String($0.filter { $0.isNumber })) ?? 0 }
+    }
+    let pa = parts(a), pb = parts(b)
+    let n = max(pa.count, pb.count)
+    for i in 0..<n {
+        let x = i < pa.count ? pa[i] : 0
+        let y = i < pb.count ? pb[i] : 0
+        if x > y { return 1 }
+        if x < y { return -1 }
+    }
+    return 0
+}
+
+enum UpdateCheck {
+    static let repoOwner = "keyisi"
+    static let repoName = "video-post-production"
+    static let apiURL = "https://api.github.com/repos/\(repoOwner)/\(repoName)/releases/latest"
+    static let fallbackURL = "https://github.com/\(repoOwner)/\(repoName)/releases/latest"
+    /// API 兜底通道：releases.atom 不占 API 限流额度
+    static let atomURL = "https://github.com/\(repoOwner)/\(repoName)/releases.atom"
+
+    /// 拉取 GitHub 最新 Release（只认 latest，草稿/预发布不算）
+    /// - 优先走 API；API 限流/失败时自动走 releases.atom 兜底
+    /// - 成功但仓库还没有 Release → .success(nil)
+    static func fetchLatest(timeout: TimeInterval = 12,
+                            completion: @escaping (Result<ReleaseInfo?, Error>) -> Void) {
+        fetchFromAPI(timeout: timeout) { result in
+            switch result {
+            case .success(let info):
+                completion(.success(info))
+            case .failure(let err):
+                // API 限流是常态（未认证 60 次/小时，共用出口 IP 容易撞上），改走 atom
+                fetchFromAtom(timeout: timeout) { info, atomErr in
+                    if let info = info {
+                        completion(.success(info))
+                    } else {
+                        completion(.failure(atomErr ?? err))
+                    }
+                }
+            }
+        }
+    }
+
+    private static func fetchFromAPI(timeout: TimeInterval,
+                                     completion: @escaping (Result<ReleaseInfo?, Error>) -> Void) {
+        guard let url = URL(string: apiURL) else {
+            completion(.failure(NSError(domain: "Update", code: -2,
+                                        userInfo: [NSLocalizedDescriptionKey: "更新地址无效"])))
+            return
+        }
+        var req = URLRequest(url: url, timeoutInterval: timeout)
+        req.httpMethod = "GET"
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("Video-Post-Production", forHTTPHeaderField: "User-Agent")
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            if let error = error {
+                completion(.failure(error)); return
+            }
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data),
+                  let dict = obj as? [String: Any] else {
+                completion(.failure(NSError(domain: "Update", code: -1,
+                                            userInfo: [NSLocalizedDescriptionKey: "无法解析 GitHub 返回的数据"])))
+                return
+            }
+            let tag = (dict["tag_name"] as? String) ?? ""
+            if tag.isEmpty {
+                // GitHub 限流 / 报错时会返回 {"message": "..."}
+                let msg = (dict["message"] as? String) ?? "仓库还没有发布任何 Release"
+                completion(.failure(NSError(domain: "Update", code: -3,
+                                            userInfo: [NSLocalizedDescriptionKey: msg])))
+                return
+            }
+            var info = ReleaseInfo()
+            info.tag = tag
+            info.version = tag
+            info.htmlURL = (dict["html_url"] as? String) ?? fallbackURL
+            info.notes = (dict["body"] as? String) ?? ""
+            if let assets = dict["assets"] as? [[String: Any]] {
+                let zipAsset = assets.first { (($0["name"] as? String) ?? "").lowercased().hasSuffix(".zip") }
+                if let z = zipAsset {
+                    info.assetName = z["name"] as? String
+                    info.assetURL = z["browser_download_url"] as? String
+                    info.assetSize = (z["size"] as? NSNumber)?.int64Value
+                }
+            }
+            completion(.success(info))
+        }.resume()
+    }
+
+    /// 兜底：解析 https://github.com/…/releases.atom 的第一条 entry
+    private static func fetchFromAtom(timeout: TimeInterval,
+                                      completion: @escaping (ReleaseInfo?, Error?) -> Void) {
+        guard let url = URL(string: atomURL) else { completion(nil, nil); return }
+        var req = URLRequest(url: url, timeoutInterval: timeout)
+        req.setValue("Video-Post-Production", forHTTPHeaderField: "User-Agent")
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        URLSession.shared.dataTask(with: req) { data, _, error in
+            if let error = error { completion(nil, error); return }
+            guard let data = data, let xml = String(data: data, encoding: .utf8) else {
+                completion(nil, NSError(domain: "Update", code: -4,
+                                        userInfo: [NSLocalizedDescriptionKey: "读取更新信息失败"]))
+                return
+            }
+            let parts = xml.components(separatedBy: "<entry>")
+            guard parts.count > 1 else { completion(nil, nil); return }
+            let first = parts[1].components(separatedBy: "</entry>")[0]
+            var title = textBetween(first, start: "<title>", end: "</title>")
+            if title.isEmpty {
+                // id 形如 tag:github.com,2008:Repository/123/v3.14.1
+                let id = textBetween(first, start: "<id>", end: "</id>")
+                title = id.components(separatedBy: "/").last ?? ""
+            }
+            if title.isEmpty { completion(nil, nil); return }
+            // link 形如 <link type="text/html" href="https://github.com/…/releases/tag/v3.14.1"/>
+            var html = ""
+            for chunk in first.components(separatedBy: "<link") where chunk.contains("text/html") {
+                html = textBetween(chunk, start: "href=\"", end: "\"")
+                if !html.isEmpty { break }
+            }
+            var info = ReleaseInfo()
+            info.tag = title
+            info.version = title
+            info.htmlURL = html.isEmpty ? fallbackURL : html
+            info.notes = ""
+            completion(info, nil)
+        }.resume()
+    }
+
+    private static func textBetween(_ s: String, start: String, end: String) -> String {
+        guard let a = s.range(of: start),
+              let b = s.range(of: end, range: a.upperBound..<s.endIndex) else { return "" }
+        return String(s[a.upperBound..<b.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 精简 Release 说明用于弹窗展示
+    static func briefNotes(_ notes: String, limit: Int = 420) -> String {
+        let body = notes
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#")
+                      && !$0.trimmingCharacters(in: .whitespaces).hasPrefix("---") }
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        if body.count <= limit { return body }
+        return String(body.prefix(limit)) + "…"
+    }
+}
+
 enum FrameResult {
     case ok(saved: Int, skipped: Int)
     case fail(String)
