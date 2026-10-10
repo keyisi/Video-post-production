@@ -90,6 +90,8 @@ Video Post-Production 目前有五个板块，其中「插入封面」和「结�
 ```swift
 enum SegmentID: String, CaseIterable {
     case cover, source, fadeOut, whiteHold, fadeIn, freeze
+    /// 仅用于行 1 总览里的「结尾」汇总段，不参与行 2 布局
+    case ending
 }
 
 /// 时间线上的一段
@@ -125,15 +127,22 @@ struct TimelineModel {
     /// frozenWindow 非空时用它做像素换算（拖拽期间冻结，见第 7.2 节）
     func toJobSettings() -> JobSettings
     func clamp(_ value: Double, for id: SegmentID) -> Double
-    func layout(width: CGFloat, frozenWindow: Double? = nil) -> [LaidOutSegment]
+    /// 行 2 尾部窗口；行 1 总览见 overview()
+    func layout(width: Double, frozenWindow: Double? = nil) -> [LaidOutSegment]
+    /// 行 1 总览（封面 / 正片 / 结尾）
+    func overview(width: Double) -> [LaidOutSegment]
 }
 
 /// 布局结果：一段在时间线上的像素区间
+///
+/// Logic.swift 只 import Foundation，因此这里一律用 Double 而不是 CGFloat；
+/// 由 View 侧在渲染时转成 CGFloat。模型层不引用 SwiftUI / Color / CGFloat。
 struct LaidOutSegment {
     let id: SegmentID
     let title: String
-    let x: CGFloat
-    let width: CGFloat
+    let x: Double
+    let width: Double
+    let duration: Double
     let editable: Bool
     /// 渐白为 true：画成叠在正片尾部之上的半透明层，而非排在后面
     let isOverlay: Bool
