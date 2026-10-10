@@ -1550,6 +1550,17 @@ struct LaidOutSegment {
     let isOverlay: Bool
 }
 
+/// 板块从 5 个减到 4 个后的 tag 映射（旧 1/2 合并为「封面与结尾」，旧 3→2，旧 4→3）。
+/// 不做映射的话，升级前停在「整理归档」「关于与更新」的用户会看到空白页。
+func remapSection(_ old: Int) -> Int {
+    switch old {
+    case 0: return 0
+    case 1, 2: return 1
+    case 3: return 2
+    default: return 3
+    }
+}
+
 // ---------- CLI 测试入口 ----------
 
 func cliMain() {

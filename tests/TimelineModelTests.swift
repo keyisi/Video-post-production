@@ -163,6 +163,13 @@ struct TimelineModelTests {
         // 12. Review Focus #4：只插封面时文件名不变、只多 1 帧
         check(endingOffUsesInsertCover(), "testEndingOffUsesInsertCover")
 
+        // 13. Review Focus #5：板块 5→4 后的 fxt_section 错位映射
+        check(remapSection(0) == 0, "testSectionRemap0")
+        check(remapSection(1) == 1 && remapSection(2) == 1, "testSectionRemapCoverEnding")
+        check(remapSection(3) == 2, "testSectionRemapOrganizer")
+        check(remapSection(4) == 3, "testSectionRemapAbout")
+        check(remapSection(99) == 3, "testSectionRemapOutOfRange")
+
         print(failures == 0 ? "--- ALL PASS ---" : "--- \(failures) FAILED ---")
         exit(failures == 0 ? 0 : 1)
     }

@@ -287,13 +287,12 @@ struct ContentView: View {
             // 左侧导航栏
             sidebar
 
-            // 五个板块常驻视图树（不销毁）：切换回来时已选文件/日志/预览全部保留
+            // 四个板块常驻视图树（不销毁）：切换回来时已选文件/日志/预览全部保留
             ZStack {
                 sectionLayer(0) { ExtractView() }
-                sectionLayer(1) { InsertCoverView() }
-                sectionLayer(2) { EndingView() }
-                sectionLayer(3) { OrganizerView() }
-                sectionLayer(4) { AboutView() }
+                sectionLayer(1) { ComposeView() }
+                sectionLayer(2) { OrganizerView() }
+                sectionLayer(3) { AboutView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.top, 2)
@@ -302,6 +301,8 @@ struct ContentView: View {
         .frame(minWidth: 960, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
         .background(Theme.page)
         .preferredColorScheme(nil)
+        // 板块由 5 个减为 4 个：老用户存的 tag 3/4 会指向空白页，先映射一次
+        .onAppear { section = remapSection(section) }
         .task { updates.startupCheck() }
         .onReceive(NotificationCenter.default.publisher(for: .fxtCheckUpdate)) { _ in
             updates.check(manual: true)
@@ -324,10 +325,9 @@ struct ContentView: View {
 
     private let navItems: [(title: String, icon: String, tag: Int)] = [
         ("视频抽帧", "photo.on.rectangle.angled", 0),
-        ("插入封面", "photo.badge.plus", 1),
-        ("结尾处理", "flag.checkered", 2),
-        ("整理归档", "archivebox", 3),
-        ("关于与更新", "info.circle", 4),
+        ("封面与结尾", "flag.checkered", 1),
+        ("整理归档", "archivebox", 2),
+        ("关于与更新", "info.circle", 3),
     ]
 
     private var sidebar: some View {
