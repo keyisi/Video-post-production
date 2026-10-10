@@ -1420,6 +1420,67 @@ enum EndingEngine {
     }
 }
 
+// MARK: - 时间线模型（「封面与结尾」板块）
+
+enum SegmentID: String, CaseIterable {
+    case cover, source, fadeOut, whiteHold, fadeIn, freeze
+    /// 仅用于行 1 总览里的「结尾」汇总段，不参与行 2 布局
+    case ending
+}
+
+/// 时间线模型：负责时长换算、布局与钳制。
+/// 只 import Foundation，不引用 SwiftUI / CGFloat / Color——坐标一律用 Double，
+/// 由 View 侧渲染时转成 CGFloat，这样模型可以脱离 UI 跑 CLI 单测。
+struct TimelineModel {
+    var sourceDuration: Double = 0      // ffprobe 得到的真实时长，未知时为 0
+    var coverFrame: Double = 1.0 / 24   // 锁死，等于 1/fps
+    var fadeOut: Double = 0.25
+    var whiteHold: Double = 0.0
+    var fadeIn: Double = 0.25
+    var freeze: Double = 1.0
+    var endingEnabled: Bool = true
+
+    /// 正片尾部可视长度：保证渐白这一段看得见
+    var context: Double { max(1.0, fadeOut * 2) }
+
+    /// 尾部窗口总时长（行 2 铺满可用宽度的那段时间）
+    var windowDuration: Double { context + whiteHold + fadeIn + freeze }
+
+    /// 成片总时长（结尾关闭时 = 封面 + 正片）
+    var total: Double {
+        guard endingEnabled else { return coverFrame + sourceDuration }
+        return coverFrame + sourceDuration + whiteHold + fadeIn + freeze
+    }
+
+    /// 按段钳制。范围与 ffmpeg 的前置校验对齐：
+    /// `dur > fadeOut + 0.1` → 渐白上限 = sourceDuration - 0.1
+    func clamp(_ value: Double, for id: SegmentID) -> Double {
+        switch id {
+        case .fadeOut:
+            let upper = sourceDuration > 0 ? max(0.05, sourceDuration - 0.1) : 10
+            return min(max(value, 0.05), upper)
+        case .whiteHold:
+            return min(max(value, 0), 10)
+        case .fadeIn:
+            return min(max(value, 0.05), 10)
+        case .freeze:
+            return min(max(value, 0.1), 30)
+        case .cover, .source, .ending:
+            return value
+        }
+    }
+
+    /// 时间线拥有的四个字段 → JobSettings；其余（音效/后缀/编码等）由调用方补齐
+    func toJobSettings() -> JobSettings {
+        var s = JobSettings()
+        s.fadeOut = clamp(fadeOut, for: .fadeOut)
+        s.whiteHold = clamp(whiteHold, for: .whiteHold)
+        s.fadeIn = clamp(fadeIn, for: .fadeIn)
+        s.freeze = clamp(freeze, for: .freeze)
+        return s
+    }
+}
+
 // ---------- CLI 测试入口 ----------
 
 func cliMain() {
