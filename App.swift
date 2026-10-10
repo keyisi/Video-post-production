@@ -667,12 +667,47 @@ struct TimelineBar: View {
     /// 拖拽结束
     var onDragEnded: (() -> Void)? = nil
 
+    /// 拖拽期间冻结的窗口总时长（按下瞬间写入，松手清空）
     @State private var dragFrozen: Double? = nil
+    /// 按下瞬间该段的时长，拖拽全程以它为基准累加
+    @State private var dragOrigin: Double = 0
+    /// 非 nil 表示对应段被拖到了钳制上限
+    @State private var hitLimit: SegmentID? = nil
 
     private var effectiveFrozen: Double? { dragFrozen ?? frozenWindow }
 
     private var overview: [LaidOutSegment] { model.overview(width: Double(width)) }
     private var tail: [LaidOutSegment] { model.layout(width: Double(width), frozenWindow: effectiveFrozen) }
+
+    /// 秒/像素：拖拽换算与布局必须用同一个，否则边界会漂
+    private var secPerPx: Double {
+        let usable = max(Double(width) - 24, 1)
+        return max(effectiveFrozen ?? model.windowDuration, 0.001) / usable
+    }
+
+    /// 段当前的时长
+    private func current(_ id: SegmentID) -> Double {
+        switch id {
+        case .fadeOut: return model.fadeOut
+        case .whiteHold: return model.whiteHold
+        case .fadeIn: return model.fadeIn
+        case .freeze: return model.freeze
+        default: return 0
+        }
+    }
+
+    /// 可拖手柄：(段, 手柄所在 x)
+    private var handleSpecs: [(SegmentID, Double)] {
+        tail.compactMap { seg in
+            switch seg.id {
+            case .fadeOut: return (.fadeOut, seg.x)                 // 拖左缘
+            case .whiteHold: return (.whiteHold, seg.x + seg.width) // 拖右缘
+            case .fadeIn: return (.fadeIn, seg.x + seg.width)
+            case .freeze: return (.freeze, seg.x + seg.width)
+            default: return nil
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -702,11 +737,17 @@ struct TimelineBar: View {
                     .font(.system(size: 10.5, design: .rounded))
                     .foregroundStyle(.secondary)
             }
-            trackRow(tail, height: 44)
+            trackRow(tail, height: 44, handles: true)
 
-            Text("渐白叠在正片最后 \(String(format: "%.2f", model.fadeOut)) 秒上，其后依次是全白 → 渐显 → 定格")
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
+            if let lim = hitLimit {
+                Text(limitHint(for: lim))
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(Theme.warn)
+            } else {
+                Text("拖动色块之间的小竖条可改时长；渐白叠在正片最后 \(String(format: "%.2f", model.fadeOut)) 秒上")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -716,7 +757,8 @@ struct TimelineBar: View {
     }
 
     @ViewBuilder
-    private func trackRow(_ segs: [LaidOutSegment], height: CGFloat) -> some View {
+    private func trackRow(_ segs: [LaidOutSegment], height: CGFloat,
+                          handles: Bool = false) -> some View {
         ZStack(alignment: .leading) {
             ForEach(Array(segs.enumerated()), id: \.offset) { _, seg in
                 Group {
@@ -729,10 +771,75 @@ struct TimelineBar: View {
                 .frame(width: max(CGFloat(seg.width), 2), height: height)
                 .offset(x: CGFloat(seg.x))
             }
+            if handles {
+                ForEach(Array(handleSpecs.enumerated()), id: \.offset) { _, h in
+                    handleView(id: h.0, x: h.1, height: height)
+                }
+            }
         }
         .frame(width: width, height: height, alignment: .leading)
         .background(Color.primary.opacity(0.04))
         .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    /// 一个可拖的边界手柄：视觉是 5px 竖条，命中区放宽到 14px
+    private func handleView(id: SegmentID, x: Double, height: CGFloat) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(hitLimit == id ? Theme.warn : Color.primary.opacity(0.7))
+                .frame(width: 5, height: height + 8)
+        }
+        .frame(width: 14, height: height + 8)
+        .contentShape(Rectangle())
+        .offset(x: CGFloat(x) - 7)
+        .gesture(dragGesture(for: id))
+        .help("拖动调整「\(title(of: id))」时长")
+    }
+
+    private func dragGesture(for id: SegmentID) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                if dragFrozen == nil {
+                    dragFrozen = model.windowDuration
+                    dragOrigin = current(id)
+                }
+                let delta = Double(v.translation.width) * secPerPx
+                // 渐白拖的是左缘：往左拖 = 变长
+                let wanted = id == .fadeOut ? dragOrigin - delta : dragOrigin + delta
+                let clamped = model.clamp(wanted, for: id)
+                hitLimit = abs(clamped - wanted) > 1e-6 ? id : nil
+                onDragChanged?(id, clamped)
+            }
+            .onEnded { _ in
+                let stepped = (current(id) / 0.05).rounded() * 0.05
+                onDragChanged?(id, model.clamp(stepped, for: id))
+                dragFrozen = nil
+                hitLimit = nil
+                onDragEnded?()
+            }
+    }
+
+    private func title(of id: SegmentID) -> String {
+        switch id {
+        case .fadeOut: return "渐白"
+        case .whiteHold: return "全白"
+        case .fadeIn: return "渐显"
+        case .freeze: return "定格"
+        default: return ""
+        }
+    }
+
+    private func limitHint(for id: SegmentID) -> String {
+        switch id {
+        case .fadeOut:
+            let upper = model.sourceDuration > 0
+                ? max(0.05, model.sourceDuration - 0.1) : 10
+            return "渐白最长 \(String(format: "%.2f", upper)) 秒（正片 \(String(format: "%.1f", model.sourceDuration)) 秒）"
+        case .whiteHold: return "全白保持范围 0 – 10 秒"
+        case .fadeIn: return "渐显范围 0.05 – 10 秒"
+        case .freeze: return "定格范围 0.1 – 30 秒"
+        default: return ""
+        }
     }
 
     @ViewBuilder
