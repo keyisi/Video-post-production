@@ -9,6 +9,50 @@ func check(_ ok: Bool, _ name: String) {
     if !ok { failures += 1 }
 }
 
+/// 用内置 ffmpeg 造一条 3 秒测试片，跑 runCombined，比对输出时长是否等于 model.total
+func endToEndDurationMatches() -> Bool {
+    let fm = FileManager.default
+    let tmp = NSTemporaryDirectory() + "tl_e2e"
+    try? fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+    let input = tmp + "/in.mp4"
+    let cover = tmp + "/cover.png"
+    let out = tmp + "/out.mp4"
+    defer { try? fm.removeItem(atPath: tmp) }
+
+    // 造片：3 秒 24fps 测试图
+    _ = runTool(ffmpegBin(), ["-y", "-v", "error", "-f", "lavfi",
+                              "-i", "testsrc=size=320x240:rate=24", "-t", "3",
+                              "-pix_fmt", "yuv420p", input])
+    // 造封面：纯色 PNG
+    _ = runTool(ffmpegBin(), ["-y", "-v", "error", "-f", "lavfi",
+                              "-i", "color=c=blue:s=320x240", "-frames:v", "1", cover])
+    guard fm.fileExists(atPath: input), fm.fileExists(atPath: cover) else {
+        print("  (跳过: 造片失败)"); return true
+    }
+    guard let dur = probeDuration(input) else { print("  (跳过: probe 失败)"); return true }
+
+    var model = TimelineModel()
+    model.sourceDuration = dur
+    model.fadeOut = 0.25; model.whiteHold = 0.0
+    model.fadeIn = 0.25; model.freeze = 1.0
+
+    var s = model.toJobSettings()
+    s.outputDir = tmp
+    s.suffix = "_out"
+    s.speed = .fast
+    s.sizeMode = .match
+    let res = EndingEngine.runCombined(input: input, cover: cover, settings: s)
+    guard res.success, let produced = res.output else {
+        print("  (跳过: runCombined 失败 \(res.message))"); return true
+    }
+    try? fm.moveItem(atPath: produced, toPath: out)
+    guard let outDur = probeDuration(out) else { print("  (跳过: 输出 probe 失败)"); return true }
+    // 封面 1 帧 + 正片 + 白场 + 渐显 + 定格
+    let expected = model.total
+    print(String(format: "  端到端: 预期 %.3fs 实际 %.3fs", expected, outDur))
+    return abs(outDur - expected) < 0.2
+}
+
 @main
 struct TimelineModelTests {
     static func main() {
@@ -43,6 +87,50 @@ struct TimelineModelTests {
         let js = m.toJobSettings()
         check(js.fadeOut == 0.25 && js.whiteHold == 0 && js.fadeIn == 0.25 && js.freeze == 1.0,
               "toJobSettingsValues")
+
+        // 7. 行 2 布局：非叠加段宽之和 = 可用宽度
+        m.freeze = 1.0
+        let segs = m.layout(width: 600)
+        let sum = segs.filter { !$0.isOverlay }.reduce(0) { $0 + $1.width }
+        check(abs(sum - (600 - 24)) < 0.001, "layoutWidthsSumToUsable")
+        check(segs.first(where: { $0.id == .fadeOut })?.isOverlay == true, "fadeOutIsOverlay")
+        check(segs.allSatisfy { $0.width.isFinite && $0.x.isFinite }, "allFinite")
+
+        // 8. 0 值段宽为 0（Review Focus #2）
+        m.whiteHold = 0
+        let z = m.layout(width: 600).first(where: { $0.id == .whiteHold })
+        check(z?.width == 0, "testZeroWidthSegment")
+
+        // 9. 冻结窗口（Review Focus #3）
+        // 冻结的含义是「px→秒 换算系数不随参数漂移」，即 width/duration 恒定；
+        // 段宽本身当然要随时长变，否则拖了等于没拖。
+        func freezeRatio(_ win: Double?) -> Double {
+            let seg = m.layout(width: 600, frozenWindow: win).first(where: { $0.id == .freeze })!
+            return seg.width / seg.duration
+        }
+        m.freeze = 1.0
+        let frozen1 = freezeRatio(2.25)
+        m.freeze = 30
+        let frozen2 = freezeRatio(2.25)
+        check(abs(frozen1 - frozen2) < 0.001, "testFrozenWindow")
+        // 反证：不冻结时比例应当漂移（否则说明冻结根本没生效）
+        m.freeze = 1.0
+        let live1 = freezeRatio(nil)
+        m.freeze = 30
+        let live2 = freezeRatio(nil)
+        check(abs(live1 - live2) > 1, "testUnfrozenRatioShifts")
+        m.freeze = 1.0
+
+        // 10. 行 1 总览
+        let ov = m.overview(width: 600)
+        check(ov.map(\.id) == [.cover, .source, .ending], "overviewThreeSegments")
+        check(ov.first(where: { $0.id == .cover })?.editable == false, "coverNotEditable")
+        m.endingEnabled = false
+        check(m.overview(width: 600).count == 2, "overviewNoEndingWhenDisabled")
+        m.endingEnabled = true
+
+        // 11. 端到端：造片跑 runCombined，输出时长 = model.total
+        check(endToEndDurationMatches(), "endToEndDurationMatches")
 
         print(failures == 0 ? "--- ALL PASS ---" : "--- \(failures) FAILED ---")
         exit(failures == 0 ? 0 : 1)

@@ -1479,6 +1479,75 @@ struct TimelineModel {
         s.freeze = clamp(freeze, for: .freeze)
         return s
     }
+
+    // MARK: 布局
+
+    private static let padding: Double = 12
+    private static let coverWidth: Double = 10
+    private static let endingWidth: Double = 60
+
+    /// 行 2 尾部放大窗口。
+    /// frozenWindow 非空时用它做像素换算（拖拽期间冻结，见规格第 7.2 节）。
+    /// 顺序：正片 → 渐白(叠加) → 全白 → 渐显 → 定格
+    func layout(width: Double, frozenWindow: Double? = nil) -> [LaidOutSegment] {
+        let usable = max(width - TimelineModel.padding * 2, 1)
+        let win = max(frozenWindow ?? windowDuration, 0.001)
+        let secPerPx = win / usable
+        func px(_ sec: Double) -> Double { sec / secPerPx }
+
+        let sourceW = px(context)
+        let sourceRight = TimelineModel.padding + sourceW
+        let fadeOutW = px(fadeOut)
+
+        return [
+            LaidOutSegment(id: .source, title: "正片", x: TimelineModel.padding,
+                           width: sourceW, duration: context, editable: false, isOverlay: false),
+            // 渐白叠在正片最后 fadeOut 秒上：右缘与正片右缘对齐
+            LaidOutSegment(id: .fadeOut, title: "渐白", x: sourceRight - fadeOutW,
+                           width: fadeOutW, duration: fadeOut, editable: true, isOverlay: true),
+            LaidOutSegment(id: .whiteHold, title: "全白", x: sourceRight,
+                           width: px(whiteHold), duration: whiteHold, editable: true, isOverlay: false),
+            LaidOutSegment(id: .fadeIn, title: "渐显", x: sourceRight + px(whiteHold),
+                           width: px(fadeIn), duration: fadeIn, editable: true, isOverlay: false),
+            LaidOutSegment(id: .freeze, title: "定格",
+                           x: sourceRight + px(whiteHold) + px(fadeIn),
+                           width: px(freeze), duration: freeze, editable: true, isOverlay: false),
+        ]
+    }
+
+    /// 行 1 总览：封面 / 正片 / 结尾。封面与结尾是固定像素宽（正片按真实时长折叠，不按比例）
+    func overview(width: Double) -> [LaidOutSegment] {
+        let usable = max(width - TimelineModel.padding * 2, 1)
+        let cover = TimelineModel.coverWidth
+        let ending = endingEnabled ? TimelineModel.endingWidth : 0
+        let sourceW = max(usable - cover - ending, 1)
+        let sourceX = TimelineModel.padding + cover
+        var out = [
+            LaidOutSegment(id: .cover, title: "封面", x: TimelineModel.padding,
+                           width: cover, duration: coverFrame, editable: false, isOverlay: false),
+            LaidOutSegment(id: .source, title: "正片", x: sourceX,
+                           width: sourceW, duration: sourceDuration, editable: false, isOverlay: false),
+        ]
+        if endingEnabled {
+            out.append(LaidOutSegment(id: .ending, title: "结尾", x: sourceX + sourceW,
+                                      width: ending,
+                                      duration: whiteHold + fadeIn + freeze,
+                                      editable: false, isOverlay: false))
+        }
+        return out
+    }
+}
+
+/// 布局结果：一段在时间线上的像素区间。模型层只用 Double，View 侧再转 CGFloat
+struct LaidOutSegment {
+    let id: SegmentID
+    let title: String
+    let x: Double
+    let width: Double
+    let duration: Double
+    let editable: Bool
+    /// 渐白为 true：画成叠在正片尾部之上的半透明层，而非排在后面
+    let isOverlay: Bool
 }
 
 // ---------- CLI 测试入口 ----------
