@@ -53,6 +53,34 @@ func endToEndDurationMatches() -> Bool {
     return abs(outDur - expected) < 0.2
 }
 
+/// Review Focus #4：结尾关闭走 insertCoverToVideo——输出文件名必须不变、时长 = 正片 + 1 帧。
+/// 这是 ComposeView 那条分支所依赖的契约，钉在这里防止引擎行为漂移。
+func endingOffUsesInsertCover() -> Bool {
+    let fm = FileManager.default
+    let tmp = NSTemporaryDirectory() + "tl_coveronly"
+    try? fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+    let dir = tmp + "/加封面"
+    let name = "in.mp4"
+    let input = tmp + "/" + name
+    let cover = tmp + "/cover.png"
+    defer { try? fm.removeItem(atPath: tmp) }
+
+    _ = runTool(ffmpegBin(), ["-y", "-v", "error", "-f", "lavfi",
+                              "-i", "testsrc=size=320x240:rate=24", "-t", "3",
+                              "-pix_fmt", "yuv420p", input])
+    _ = runTool(ffmpegBin(), ["-y", "-v", "error", "-f", "lavfi",
+                              "-i", "color=c=blue:s=320x240", "-frames:v", "1", cover])
+    guard let dur = probeDuration(input) else { print("  (跳过: probe 失败)"); return true }
+
+    let ok = insertCoverToVideo(input, coverPath: cover, outputDir: dir,
+                                sizeMode: .match) { _ in }
+    guard ok else { return false }
+    let out = dir + "/" + name          // 文件名必须不变
+    guard fm.fileExists(atPath: out), let outDur = probeDuration(out) else { return false }
+    print(String(format: "  只插封面: 原名 %@ 时长 %.3fs（正片 %.3fs）", name, outDur, dur))
+    return abs(outDur - dur) < 0.2      // 只多 1 帧，差值应在 0.2 秒内
+}
+
 @main
 struct TimelineModelTests {
     static func main() {
@@ -131,6 +159,9 @@ struct TimelineModelTests {
 
         // 11. 端到端：造片跑 runCombined，输出时长 = model.total
         check(endToEndDurationMatches(), "endToEndDurationMatches")
+
+        // 12. Review Focus #4：只插封面时文件名不变、只多 1 帧
+        check(endingOffUsesInsertCover(), "testEndingOffUsesInsertCover")
 
         print(failures == 0 ? "--- ALL PASS ---" : "--- \(failures) FAILED ---")
         exit(failures == 0 ? 0 : 1)

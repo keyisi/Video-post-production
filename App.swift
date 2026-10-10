@@ -1188,6 +1188,590 @@ struct ExtractView: View {
     }
 }
 
+// MARK: - 板块: 封面与结尾（时间线）
+
+struct ComposeView: View {
+    // 文件列表用新 key（旧 key 在 onAppear 迁移一次）
+    @AppStorage("fxt_compVideos") private var videosRaw = ""
+    @AppStorage("fxt_compCovers") private var coversRaw = ""
+    @AppStorage("fxt_compEndingOn") private var endingOn = true
+    // 时间参数复用原有 key：语义没变，老用户升级后不用重设
+    @AppStorage("fxt_endFadeOut") private var fadeOutText = "0.25"
+    @AppStorage("fxt_endWhiteHold") private var whiteHoldText = "0"
+    @AppStorage("fxt_endFadeIn") private var fadeInText = "0.25"
+    @AppStorage("fxt_endFreeze") private var freezeText = "1"
+    @AppStorage("fxt_endSfxOffset") private var sfxOffsetText = "0"
+    @AppStorage("fxt_endSfx") private var sfxPath = ""
+    @AppStorage("fxt_endSuffix") private var suffix = "定格白场"
+    @AppStorage("fxt_endRename") private var rename = true
+    @AppStorage("fxt_endOverwrite") private var overwrite = false
+    @AppStorage("fxt_endOutDir") private var outDirCustom = ""
+    @AppStorage("fxt_endAFade") private var audioFadeOn = false
+    @AppStorage("fxt_endAFadeDur") private var audioFadeDurText = "0.5"
+    @AppStorage("fxt_endSpeed") private var encSpeed = EncodeSpeed.fast.rawValue
+    @AppStorage("fxt_sizeMode") private var sizeMode = SizeMode.match.rawValue
+    // 迁移用的旧 key（只读一次）
+    @AppStorage("fxt_endVideos") private var legacyEndVideos = ""
+    @AppStorage("fxt_insVideos") private var legacyInsVideos = ""
+    @AppStorage("fxt_insCovers") private var legacyInsCovers = ""
+
+    @State private var running = false
+    @State private var stopping = false
+    @State private var progressValue: Double = 0
+    @State private var currentIdx = 0
+    @State private var logs: [String] = []
+    @State private var summary = ""
+    @State private var sourceDuration: Double = 0
+    @State private var coverFrame: Double = 1.0 / 24
+    @State private var probed = false
+
+    private var currentSpeed: EncodeSpeed { EncodeSpeed(rawValue: encSpeed) ?? .fast }
+    private var currentSize: SizeMode { SizeMode(rawValue: sizeMode) ?? .match }
+    private var videos: [String] { videosRaw.isEmpty ? [] : videosRaw.components(separatedBy: "\n") }
+    private var covers: [String] { coversRaw.isEmpty ? [] : coversRaw.components(separatedBy: "\n") }
+    private var sfxExists: Bool { !sfxPath.isEmpty && FileManager.default.fileExists(atPath: sfxPath) }
+    private var matchedCount: Int {
+        videos.filter { findCover(forVideo: $0, covers: covers) != nil }.count
+    }
+
+    private var timeline: TimelineModel {
+        var m = TimelineModel()
+        m.sourceDuration = sourceDuration
+        m.coverFrame = coverFrame
+        m.fadeOut = parseNum(fadeOutText, fallback: 0.25)
+        m.whiteHold = parseNum(whiteHoldText, fallback: 0)
+        m.fadeIn = parseNum(fadeInText, fallback: 0.25)
+        m.freeze = parseNum(freezeText, fallback: 1)
+        m.endingEnabled = endingOn
+        return m
+    }
+
+    /// 解析数字输入：兼容全角数字 / 中文逗号小数点
+    func parseNum(_ text: String, fallback: Double) -> Double {
+        let normalized = text.replacingOccurrences(of: "，", with: ".")
+            .replacingOccurrences(of: ",", with: ".")
+        let half = normalized.applyingTransform(.fullwidthToHalfwidth, reverse: false) ?? normalized
+        return Double(half) ?? fallback
+    }
+
+    var settings: JobSettings {
+        var s = timeline.toJobSettings()
+        s.sfxOffset = parseNum(sfxOffsetText, fallback: 0)
+        s.suffix = rename ? (suffix.isEmpty ? "定格白场" : suffix) : ""
+        s.overwrite = overwrite
+        let custom = outDirCustom.trimmingCharacters(in: .whitespaces)
+        s.outputDir = custom.isEmpty ? nil : custom
+        s.sfxPath = sfxExists ? sfxPath : nil
+        s.audioFade = audioFadeOn ? max(0.05, parseNum(audioFadeDurText, fallback: 0.5)) : 0
+        s.speed = currentSpeed
+        s.sizeMode = currentSize
+        return s
+    }
+
+    var canStart: Bool { !running && !videos.isEmpty }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                // 1. 视频
+                DropZone(icon: "film.stack", title: "拖入视频，或点击选择",
+                         hint: "支持多选 · 封面按集数自动匹配对应视频",
+                         files: videos, running: running,
+                         onPick: pickVideos, onClear: { videosRaw = "" }, onDrop: handleDropVideos)
+
+                // 2. 封面
+                DropZone(icon: "photo.stack", title: "拖入封面图，或点击选择",
+                         hint: "支持多选 · 文件名需含集数，如 Stranger Things EP02_cover.jpg",
+                         files: covers, running: running,
+                         onPick: pickCovers, onClear: { coversRaw = "" }, onDrop: handleDropCovers)
+
+                if !videos.isEmpty && !covers.isEmpty {
+                    HStack(spacing: 8) {
+                        Image(systemName: matchedCount == videos.count
+                              ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(matchedCount == videos.count ? Theme.ok : Theme.warn)
+                        Text("\(matchedCount)/\(videos.count) 个视频已按集数配对封面")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(matchedCount == videos.count ? Theme.ok : Theme.warn)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Theme.card)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08)))
+                }
+
+                // 3. 时间线
+                GeometryReader { geo in
+                    TimelineBar(model: timeline, width: max(geo.size.width, 240),
+                                onDragChanged: applyDrag, onDragEnded: {})
+                }
+                .frame(height: 220)
+
+                // 4. 结尾开关 + 时间轴参数
+                Card {
+                    HStack(spacing: 8) {
+                        Toggle("处理结尾", isOn: $endingOn)
+                            .toggleStyle(.switch)
+                            .font(.system(size: 12, weight: .semibold))
+                            .disabled(running)
+                        Text(endingOn
+                             ? "封面 + 结尾一次编码完成（少一遍转码）"
+                             : "只把封面插入视频开头，不动结尾")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    if endingOn {
+                        Divider().opacity(0.4)
+                        FieldLabel("timer", "时间轴参数（秒）")
+                        HStack(spacing: 10) {
+                            endField("渐白", $fadeOutText)
+                            endField("全白保持", $whiteHoldText)
+                            endField("渐显", $fadeInText)
+                            endField("定格", $freezeText)
+                            endField("音效偏移", $sfxOffsetText)
+                            Spacer()
+                        }
+                        HStack(spacing: 8) {
+                            Toggle("原视频音频淡出", isOn: $audioFadeOn).toggleStyle(.checkbox)
+                                .font(.system(size: 11))
+                                .disabled(running)
+                            NiceField("0.5", text: $audioFadeDurText, width: 60, disabled: running || !audioFadeOn)
+                            Text("秒 · 正片音频在结尾渐弱到无声")
+                                .font(.system(size: 10.5))
+                                .foregroundStyle(.tertiary)
+                                .opacity(audioFadeOn ? 1 : 0.5)
+                            Spacer()
+                        }
+                    }
+                }
+
+                // 5. 音效
+                if endingOn {
+                    Card {
+                        FieldLabel("speaker.wave.2", "音效")
+                        HStack(spacing: 8) {
+                            Image(systemName: sfxExists ? "checkmark.circle.fill" : "exclamationmark.circle")
+                                .font(.system(size: 11))
+                                .foregroundStyle(sfxExists ? Theme.ok : Color.primary.opacity(0.35))
+                            NiceField("音效文件路径（留空则不加音效）", text: $sfxPath, disabled: running)
+                            Button { pickSFX() } label: {
+                                Image(systemName: "folder.badge.plus").font(.system(size: 11))
+                            }
+                            .buttonStyle(.plain)
+                            .padding(7)
+                            .background(Theme.card)
+                            .clipShape(RoundedRectangle(cornerRadius: 7))
+                            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1)))
+                            .disabled(running)
+                            .help("选择音效文件")
+                        }
+                    }
+                }
+
+                // 6. 输出
+                Card {
+                    FieldLabel("folder", "输出")
+                    HStack(spacing: 8) {
+                        NiceField(endingOn ? "默认: 每个视频旁的「加结尾」文件夹"
+                                          : "默认: 每个视频旁的「加封面」文件夹",
+                                  text: $outDirCustom, disabled: running)
+                        Button { pickOutDir() } label: {
+                            Image(systemName: "folder.badge.plus").font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain).padding(7).background(Theme.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1)))
+                        .disabled(running)
+                        Button { openOutput() } label: {
+                            Label("打开", systemImage: "folder").font(.system(size: 11.5))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Theme.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1)))
+                        .disabled(running || videos.isEmpty)
+                    }
+                    if endingOn {
+                        HStack(spacing: 10) {
+                            FieldLabel("slider.horizontal.3", "输出体积")
+                            Picker("", selection: $sizeMode) {
+                                ForEach(SizeMode.allCases, id: \.rawValue) { m in
+                                    Text(m.label).tag(m.rawValue)
+                                }
+                            }
+                            .pickerStyle(.segmented).labelsHidden().frame(width: 160)
+                            .disabled(running)
+                            Text(currentSize.hint).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                            Spacer()
+                        }
+                        HStack(spacing: 10) {
+                            FieldLabel("gauge", "编码速度")
+                            Picker("", selection: $encSpeed) {
+                                ForEach(EncodeSpeed.allCases, id: \.rawValue) { s in
+                                    Text(s.label).tag(s.rawValue)
+                                }
+                            }
+                            .pickerStyle(.segmented).labelsHidden().frame(width: 160)
+                            .disabled(running)
+                            Text(currentSpeed.hint).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                            Spacer()
+                        }
+                        HStack(spacing: 8) {
+                            Toggle("文件名加后缀", isOn: $rename).toggleStyle(.checkbox)
+                                .font(.system(size: 11)).disabled(running)
+                            NiceField("定格白场", text: $suffix, width: 120, disabled: running || !rename)
+                            Toggle("覆盖已存在", isOn: $overwrite).toggleStyle(.checkbox)
+                                .font(.system(size: 11)).disabled(running)
+                            Spacer()
+                        }
+                    }
+                }
+
+                // 7. 日志
+                LogPanel(logs: logs).frame(minHeight: 120)
+
+                // 8. 动作区
+                HStack(spacing: 12) {
+                    Button { start() } label: {
+                        HStack(spacing: 7) {
+                            if running {
+                                ProgressView().controlSize(.small).tint(.white)
+                            } else {
+                                Image(systemName: endingOn ? "sparkles" : "photo.badge.plus")
+                                    .font(.system(size: 11, weight: .bold))
+                            }
+                            Text(running ? "正在处理…"
+                                 : (endingOn ? "封面 + 结尾一次编码" : "把封面插入视频开头"))
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        .padding(.horizontal, 22).padding(.vertical, 9)
+                        .foregroundStyle(.white)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9)
+                                .fill(LinearGradient(colors: [Theme.accent, Theme.accentDeep],
+                                                     startPoint: .leading, endPoint: .trailing))
+                                .opacity(canStart ? 1 : 0.35))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canStart)
+
+                    if running {
+                        Button { stop() } label: {
+                            HStack(spacing: 7) {
+                                Image(systemName: "stop.fill").font(.system(size: 10.5, weight: .bold))
+                                Text(stopping ? "正在停止…" : "停止处理")
+                                    .font(.system(size: 13, weight: .semibold))
+                            }
+                            .padding(.horizontal, 18).padding(.vertical, 9)
+                            .foregroundStyle(.white)
+                            .background(RoundedRectangle(cornerRadius: 9)
+                                .fill(Theme.warn.opacity(stopping ? 0.45 : 0.95)))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(stopping)
+                    }
+
+                    if !summary.isEmpty {
+                        Text(summary)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(summary.hasPrefix("已停止") ? Theme.warn : Theme.ok)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                }
+
+                if running || progressValue > 0 {
+                    NiceProgress(value: progressValue,
+                                 label: running ? "\(min(currentIdx + 1, max(videos.count, 1)))/\(videos.count)" : nil)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 16)
+        }
+        .onAppear {
+            migrateLegacyFiles()
+            if sfxPath.isEmpty { sfxPath = EndingEngine.defaultSFX }
+            refreshProbe()
+        }
+        .onChange(of: videosRaw) { _ in refreshProbe() }
+    }
+
+    // MARK: 迁移与探测
+
+    /// 旧板块的文件列表搬过来一次
+    private func migrateLegacyFiles() {
+        guard videosRaw.isEmpty else { return }
+        if !legacyEndVideos.isEmpty { videosRaw = legacyEndVideos }
+        else if !legacyInsVideos.isEmpty { videosRaw = legacyInsVideos }
+        if coversRaw.isEmpty, !legacyInsCovers.isEmpty { coversRaw = legacyInsCovers }
+    }
+
+    /// 只 probe 第一个视频：时长与 fps（封面时长 = 1 帧）
+    private func refreshProbe() {
+        guard let first = videos.first else {
+            sourceDuration = 0; coverFrame = 1.0 / 24; probed = false; return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            let dur = probeDuration(first) ?? 0
+            let fps = probeVideoInfo(first)?.2 ?? 24
+            DispatchQueue.main.async {
+                sourceDuration = dur
+                coverFrame = fps > 0 ? 1.0 / fps : 1.0 / 24
+                probed = dur > 0
+            }
+        }
+    }
+
+    // MARK: 时间线交互
+
+    private func applyDrag(_ id: SegmentID, _ value: Double) {
+        let text = String(format: "%.2f", value)
+        switch id {
+        case .fadeOut: fadeOutText = text
+        case .whiteHold: whiteHoldText = text
+        case .fadeIn: fadeInText = text
+        case .freeze: freezeText = text
+        default: break
+        }
+    }
+
+    private func endField(_ label: String, _ binding: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label).font(.system(size: 10.5)).foregroundStyle(.secondary)
+            NiceField("", text: binding, width: 78, disabled: running)
+        }
+    }
+
+    // MARK: 输出目录
+
+    private func currentOutDir(for video: String) -> String {
+        let custom = outDirCustom.trimmingCharacters(in: .whitespaces)
+        if !custom.isEmpty { return custom }
+        let folder = endingOn ? "加结尾" : "加封面"
+        return URL(fileURLWithPath: video).deletingLastPathComponent()
+            .appendingPathComponent(folder).path
+    }
+
+    private var effectiveOutDir: String? {
+        let custom = outDirCustom.trimmingCharacters(in: .whitespaces)
+        if !custom.isEmpty { return custom }
+        guard let first = videos.first else { return nil }
+        return URL(fileURLWithPath: first).deletingLastPathComponent()
+            .appendingPathComponent(endingOn ? "加结尾" : "加封面").path
+    }
+
+    private func openOutput() {
+        if let od = effectiveOutDir, FileManager.default.fileExists(atPath: od) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: od))
+        }
+    }
+
+    // MARK: 文件选择
+
+    func pickVideos() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .video, .avi]
+        if panel.runModal() == .OK { videosRaw = panel.urls.map { $0.path }.joined(separator: "\n") }
+    }
+
+    func pickCovers() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.image]
+        if panel.runModal() == .OK { coversRaw = panel.urls.map { $0.path }.joined(separator: "\n") }
+    }
+
+    func pickSFX() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.audio]
+        if panel.runModal() == .OK, let u = panel.url { sfxPath = u.path }
+    }
+
+    func pickOutDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false; panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        if panel.runModal() == .OK, let u = panel.url { outDirCustom = u.path }
+    }
+
+    func collectURLs(_ providers: [NSItemProvider]) -> [URL] {
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        let q = DispatchQueue(label: "dropc")
+        for p in providers {
+            group.enter()
+            _ = p.loadObject(ofClass: URL.self) { url, _ in
+                if let url { q.async { urls.append(url); group.leave() } } else { group.leave() }
+            }
+        }
+        group.wait()
+        return urls
+    }
+
+    func handleDropVideos(_ providers: [NSItemProvider]) -> Bool {
+        if running { return false }
+        let urls = collectURLs(providers)
+        DispatchQueue.main.async { videosRaw = urls.map { $0.path }.joined(separator: "\n") }
+        return !urls.isEmpty
+    }
+
+    func handleDropCovers(_ providers: [NSItemProvider]) -> Bool {
+        if running { return false }
+        let urls = collectURLs(providers)
+        DispatchQueue.main.async { coversRaw = urls.map { $0.path }.joined(separator: "\n") }
+        return !urls.isEmpty
+    }
+
+    // MARK: 执行
+
+    func start() {
+        let list = videos
+        let coverList = covers
+        let s = settings
+        let withEnding = endingOn
+        running = true
+        stopping = false
+        summary = ""
+        progressValue = 0
+        currentIdx = 0
+        RunControl.shared.begin()
+        let customDir = outDirCustom.trimmingCharacters(in: .whitespaces)
+        let folder = withEnding ? "加结尾" : "加封面"
+        if customDir.isEmpty {
+            for d in Set(list.map {
+                URL(fileURLWithPath: $0).deletingLastPathComponent()
+                    .appendingPathComponent(folder).path }) {
+                try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true)
+            }
+        } else {
+            try? FileManager.default.createDirectory(atPath: customDir, withIntermediateDirectories: true)
+        }
+
+        let modeText: String
+        if !withEnding { modeText = "只插封面" }
+        else if coverList.isEmpty { modeText = "结尾处理" }
+        else { modeText = "封面+结尾（一次编码）" }
+        var head = "开始\(modeText) \(list.count) 个视频"
+        if withEnding {
+            head += "：渐白 \(s.fadeOut)秒 / 全白保持 \(s.whiteHold)秒 / 渐显 \(s.fadeIn)秒 / 定格 \(s.freeze)秒"
+                + "，音效：\(s.sfxPath ?? "无")"
+                + (s.audioFade > 0 ? "，原视频音频淡出 \(s.audioFade)秒" : "")
+                + "，编码 \(s.speed.label)，体积 \(s.sizeMode.label)"
+        } else {
+            head += "：\(coverList.count) 张封面按集数匹配，体积 \(s.sizeMode.label)"
+        }
+        head += customDir.isEmpty ? "，输出到每个视频旁的「\(folder)」文件夹" : "，输出到 \(customDir)"
+        logs = [head]
+
+        let size = currentSize
+        DispatchQueue.global(qos: .userInitiated).async {
+            var okCount = 0, failCount = 0
+            var stopped = false
+            let batchStart = Date()
+            for (vi, video) in list.enumerated() {
+                if RunControl.shared.isCancelled { stopped = true; break }
+                let vName = URL(fileURLWithPath: video).lastPathComponent
+                let outDir = customDir.isEmpty
+                    ? URL(fileURLWithPath: video).deletingLastPathComponent()
+                        .appendingPathComponent(folder).path
+                    : customDir
+
+                if !withEnding {
+                    // 路径 A：只插封面 → 文件名不变
+                    guard let cover = findCover(forVideo: video, covers: coverList) else {
+                        failCount += 1
+                        DispatchQueue.main.async {
+                            logs.append("[\(vi+1)/\(list.count)] \(vName) 跳过: 没有匹配集数的封面图")
+                            progressValue = Double(vi + 1) / Double(list.count); currentIdx = vi + 1
+                        }
+                        continue
+                    }
+                    let cName = URL(fileURLWithPath: cover).lastPathComponent
+                    let t0 = Date()
+                    let ok = insertCoverToVideo(video, coverPath: cover, outputDir: outDir,
+                                                sizeMode: size) { msg in
+                        DispatchQueue.main.async { logs.append("[\(vi+1)/\(list.count)] \(msg)") }
+                    }
+                    if RunControl.shared.isCancelled { stopped = true; break }
+                    if ok { okCount += 1 } else { failCount += 1 }
+                    let used = Date().timeIntervalSince(t0)
+                    DispatchQueue.main.async {
+                        logs.append("[\(vi+1)/\(list.count)] \(vName) ← \(cName) \(ok ? "✓" : "✗")（用时 \(humanDuration(used))）")
+                        progressValue = Double(vi + 1) / Double(list.count); currentIdx = vi + 1
+                    }
+                    continue
+                }
+
+                // 路径 B：结尾（有封面就一次编码）
+                var sv = s
+                sv.outputDir = outDir
+                let prog: (Double) -> Void = { frac in
+                    let base = Double(vi) / Double(list.count)
+                    let span = 1.0 / Double(list.count)
+                    DispatchQueue.main.async {
+                        progressValue = min(base + span * max(0, min(frac, 1)), 1)
+                    }
+                }
+                DispatchQueue.main.async { currentIdx = vi + 1 }
+                let res: EndingResult
+                if let cover = findCover(forVideo: video, covers: coverList) {
+                    res = EndingEngine.runCombined(input: video, cover: cover, settings: sv, onProgress: prog)
+                } else {
+                    res = EndingEngine.run(input: video, settings: sv, onProgress: prog)
+                    if !coverList.isEmpty {
+                        DispatchQueue.main.async {
+                            logs.append("[\(vi+1)/\(list.count)] \(vName) 未匹配到封面，只做结尾处理")
+                        }
+                    }
+                }
+                if res.cancelled {
+                    stopped = true
+                    DispatchQueue.main.async { logs.append("[\(vi+1)/\(list.count)] \(vName) ⊘ 已停止") }
+                    break
+                }
+                if res.success { okCount += 1 } else { failCount += 1 }
+                let line = "[\(vi+1)/\(list.count)] \(vName) \(res.success ? "✓" : "✗") \(res.message)"
+                DispatchQueue.main.async {
+                    logs.append(line)
+                    if logs.count > 300 { logs.removeFirst(logs.count - 300) }
+                    progressValue = Double(vi + 1) / Double(list.count)
+                }
+            }
+            let wall = Date().timeIntervalSince(batchStart)
+            let summaryText: String
+            if stopped {
+                let rest = max(list.count - okCount - failCount, 0)
+                summaryText = "已停止: 完成 \(okCount) 个，剩余 \(rest) 个未处理 · 已用时 \(humanDuration(wall))"
+            } else {
+                summaryText = "处理完成: 成功 \(okCount) 个, 失败 \(failCount) 个 · 总用时 \(humanDuration(wall))"
+            }
+            DispatchQueue.main.async {
+                running = false
+                stopping = false
+                RunControl.shared.reset()
+                summary = summaryText
+                logs.append(summaryText)
+            }
+        }
+    }
+
+    func stop() {
+        guard running, !stopping else { return }
+        stopping = true
+        logs.append("正在停止…（等待当前视频的编码进程退出，已完成的不受影响）")
+        RunControl.shared.cancel()
+    }
+}
+
 // MARK: - 板块 2: 插入封面
 struct InsertCoverView: View {
     // 持久化: 重开 App 保留上次导入的视频/封面
