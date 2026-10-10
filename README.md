@@ -75,13 +75,21 @@
 ## 从源码构建
 
 ```bash
-# 编译 GUI App（注意：可执行文件名为 VideoFrameTool，不是 App 显示名）
-swiftc -disable-sandbox -O -parse-as-library Logic.swift App.swift \
-  -o "build/Video Post-Production.app/Contents/MacOS/VideoFrameTool"
+./build.sh           # 一键构建 GUI App + CLI（推荐）
+./build.sh --test    # 顺便跑 TimelineModel 单测（53 条）
+```
+
+脚本会固定带 `-target arm64-apple-macosx13.0` 编译，并在结束后用 `vtool` 复核两个二进制的 `minos` 必须是 13.0，不符直接失败退出 —— **不要手写编译命令**：swiftc 不带 `-target` 时部署目标会取编译机的系统版本（本机 macOS 27 → 产物要求 macOS 27），而 plist 里的 `LSMinimumSystemVersion` 只是门面，真正决定是否可加载的是 Mach-O 的 `minos`。
+
+手动编译等价命令（可执行文件名为 `VideoFrameTool`，不是 App 显示名）：
+
+```bash
+swiftc -disable-sandbox -O -target arm64-apple-macosx13.0 -parse-as-library \
+  Logic.swift App.swift -o "build/Video Post-Production.app/Contents/MacOS/VideoFrameTool"
 codesign --force -s - "build/Video Post-Production.app"
 
-# 或编译命令行版
-swiftc -disable-sandbox -O main.swift Logic.swift -o build/videopost-cli
+swiftc -disable-sandbox -O -target arm64-apple-macosx13.0 main.swift Logic.swift -o build/videopost-cli
+vtool -show-build "build/Video Post-Production.app/Contents/MacOS/VideoFrameTool" | grep minos
 ```
 
 ### 命令行示例
