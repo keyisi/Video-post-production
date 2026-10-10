@@ -654,6 +654,152 @@ struct LogPanel: View {
     }
 }
 
+// MARK: - 时间线（「封面与结尾」板块）
+
+/// 两行时间线：行 1 总览（只读），行 2 尾部放大窗口（可拖）
+struct TimelineBar: View {
+    let model: TimelineModel
+    let width: CGFloat
+    /// 外部指定的冻结窗口（拖拽期间由内部状态覆盖）
+    var frozenWindow: Double? = nil
+    /// 拖拽中：(被拖的段, 新时长)
+    var onDragChanged: ((SegmentID, Double) -> Void)? = nil
+    /// 拖拽结束
+    var onDragEnded: (() -> Void)? = nil
+
+    @State private var dragFrozen: Double? = nil
+
+    private var effectiveFrozen: Double? { dragFrozen ?? frozenWindow }
+
+    private var overview: [LaidOutSegment] { model.overview(width: Double(width)) }
+    private var tail: [LaidOutSegment] { model.layout(width: Double(width), frozenWindow: effectiveFrozen) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // 行 1 · 总览
+            HStack(spacing: 5) {
+                Image(systemName: "film")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                Text("总览")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+            }
+            trackRow(overview, height: 30)
+
+            // 行 2 · 尾部放大窗口
+            HStack(spacing: 5) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(Theme.accent)
+                Text("结尾时间轴")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("（正片已折叠，只放大末尾）")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+                Spacer()
+                Text("窗口 \(String(format: "%.2f", model.windowDuration)) 秒")
+                    .font(.system(size: 10.5, design: .rounded))
+                    .foregroundStyle(.secondary)
+            }
+            trackRow(tail, height: 44)
+
+            Text("渐白叠在正片最后 \(String(format: "%.2f", model.fadeOut)) 秒上，其后依次是全白 → 渐显 → 定格")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.primary.opacity(0.06)))
+    }
+
+    @ViewBuilder
+    private func trackRow(_ segs: [LaidOutSegment], height: CGFloat) -> some View {
+        ZStack(alignment: .leading) {
+            ForEach(Array(segs.enumerated()), id: \.offset) { _, seg in
+                Group {
+                    if seg.width >= 1 {
+                        segmentView(seg)
+                    } else {
+                        zeroWidthMarker(seg)
+                    }
+                }
+                .frame(width: max(CGFloat(seg.width), 2), height: height)
+                .offset(x: CGFloat(seg.x))
+            }
+        }
+        .frame(width: width, height: height, alignment: .leading)
+        .background(Color.primary.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    @ViewBuilder
+    private func segmentView(_ seg: LaidOutSegment) -> some View {
+        let fill = color(for: seg.id)
+            .opacity(seg.isOverlay ? 0.62 : 1)
+        ZStack {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(fill)
+            if seg.isOverlay {
+                RoundedRectangle(cornerRadius: 4)
+                    .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [4, 2]))
+                    .foregroundStyle(color(for: seg.id))
+            }
+            VStack(spacing: 1) {
+                Text(seg.title)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .lineLimit(1)
+                if seg.width >= 46 {
+                    Text(String(format: "%.2fs", seg.duration))
+                        .font(.system(size: 10, design: .rounded))
+                        .monospacedDigit()
+                }
+            }
+            .foregroundStyle(textColor(for: seg.id))
+        }
+    }
+
+    /// 时长为 0 的段（全白）：画一条虚线缝，避免整段消失
+    @ViewBuilder
+    private func zeroWidthMarker(_ seg: LaidOutSegment) -> some View {
+        if seg.id == .whiteHold {
+            VStack(spacing: 1) {
+                Text("全白 0s")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.warn)
+                    .fixedSize()
+                    .offset(y: -14)
+                Rectangle()
+                    .fill(Theme.warn)
+                    .frame(width: 1.5)
+            }
+        } else {
+            EmptyView()
+        }
+    }
+
+    private func color(for id: SegmentID) -> Color {
+        switch id {
+        case .cover: return Color.primary.opacity(0.34)
+        case .source: return Color.primary.opacity(0.16)
+        case .fadeOut: return Theme.accent
+        case .whiteHold: return Theme.warn
+        case .fadeIn: return Theme.accentDeep
+        case .freeze: return Theme.ok
+        case .ending: return Theme.accent
+        }
+    }
+
+    private func textColor(for id: SegmentID) -> Color {
+        switch id {
+        case .cover, .source: return .primary
+        default: return .white
+        }
+    }
+}
+
 // 进度条（带百分比）
 struct NiceProgress: View {
     let value: Double
