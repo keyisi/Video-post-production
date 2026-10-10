@@ -280,6 +280,8 @@ final class UpdateCenter: ObservableObject {
 
 struct ContentView: View {
     @AppStorage("fxt_section") private var section = 0
+    /// 板块由 5 个减为 4 个的错位迁移只做一次（v3.18.0）
+    @AppStorage("fxt_sectionRemapped") private var sectionRemapped = false
     @StateObject private var updates = UpdateCenter()
 
     var body: some View {
@@ -301,8 +303,13 @@ struct ContentView: View {
         .frame(minWidth: 960, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
         .background(Theme.page)
         .preferredColorScheme(nil)
-        // 板块由 5 个减为 4 个：老用户存的 tag 3/4 会指向空白页，先映射一次
-        .onAppear { section = remapSection(section) }
+        // 板块由 5 个减为 4 个：老用户存的 tag 3/4 会指向空白页，映射一次即可。
+        // 必须只跑一次 —— remapSection 不是幂等的（2→1、3→2），每次启动都跑会把
+        // 用户当前所在板块逐次往下挪一格，最后永远停在「封面与结尾」。
+        .onAppear {
+            section = migrateSection(section, alreadyMigrated: sectionRemapped)
+            sectionRemapped = true
+        }
         .task { updates.startupCheck() }
         .onReceive(NotificationCenter.default.publisher(for: .fxtCheckUpdate)) { _ in
             updates.check(manual: true)
@@ -664,8 +671,8 @@ struct TimelineBar: View {
     var frozenWindow: Double? = nil
     /// 拖拽中：(被拖的段, 新时长)
     var onDragChanged: ((SegmentID, Double) -> Void)? = nil
-    /// 拖拽结束
-    var onDragEnded: (() -> Void)? = nil
+    /// 是否已选视频：决定空状态文案是「拖入视频」还是「读不出时长」
+    var hasVideo: Bool = true
 
     /// 拖拽期间冻结的窗口总时长（按下瞬间写入，松手清空）
     @State private var dragFrozen: Double? = nil
@@ -681,7 +688,7 @@ struct TimelineBar: View {
 
     /// 秒/像素：拖拽换算与布局必须用同一个，否则边界会漂
     private var secPerPx: Double {
-        let usable = max(Double(width) - 24, 1)
+        let usable = TimelineModel.usableWidth(Double(width))
         return max(effectiveFrozen ?? model.windowDuration, 0.001) / usable
     }
 
@@ -720,33 +727,46 @@ struct TimelineBar: View {
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
             }
-            trackRow(overview, height: 30)
-
-            // 行 2 · 尾部放大窗口
-            HStack(spacing: 5) {
-                Image(systemName: "clock.arrow.circlepath")
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(Theme.accent)
-                Text("结尾时间轴")
-                    .font(.system(size: 12, weight: .semibold))
-                Text("（正片已折叠，只放大末尾）")
+            // 还没选视频（或 probe 不出时长）：显示骨架，别画成「正片 0.00s」
+            if model.sourceDuration <= 0 {
+                skeletonRow(height: 30)
+                if model.endingEnabled { skeletonRow(height: 44) }
+                Text(hasVideo ? "读不出视频时长（ffprobe 失败），时间线按默认比例显示，参数仍可调整"
+                             : "拖入视频后显示时间线")
                     .font(.system(size: 10.5))
-                    .foregroundStyle(.tertiary)
-                Spacer()
-                Text("窗口 \(String(format: "%.2f", model.windowDuration)) 秒")
-                    .font(.system(size: 10.5, design: .rounded))
-                    .foregroundStyle(.secondary)
-            }
-            trackRow(tail, height: 44, handles: true)
-
-            if let lim = hitLimit {
-                Text(limitHint(for: lim))
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(Theme.warn)
+                    .foregroundStyle(hasVideo ? Theme.warn : .secondary)
             } else {
-                Text("拖动色块之间的小竖条可改时长；渐白叠在正片最后 \(String(format: "%.2f", model.fadeOut)) 秒上")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
+                trackRow(overview, height: 30)
+
+                // 行 2 · 尾部放大窗口 —— 结尾开关关掉时整行隐藏，
+                // 否则用户拖了参数却不生效（路径走 insertCoverToVideo，不看这四个值）
+                if model.endingEnabled {
+                    HStack(spacing: 5) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(Theme.accent)
+                        Text("结尾时间轴")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("（正片已折叠，只放大末尾）")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                        Text("窗口 \(String(format: "%.2f", model.windowDuration)) 秒")
+                            .font(.system(size: 10.5, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    trackRow(tail, height: 44, handles: true)
+
+                    if let lim = hitLimit {
+                        Text(limitHint(for: lim))
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(Theme.warn)
+                    } else {
+                        Text("拖动色块之间的小竖条可改时长；渐白叠在正片最后 \(String(format: "%.2f", model.fadeOut)) 秒上")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
         }
         .padding(14)
@@ -782,6 +802,24 @@ struct TimelineBar: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
+    /// 空状态骨架：没选视频 / probe 不出时长时用，避免画成「正片 0.00s」
+    private func skeletonRow(height: CGFloat) -> some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.primary.opacity(0.06))
+                .frame(width: width * 0.62, height: height * 0.6)
+                .offset(x: 12)
+        }
+        .frame(width: width, height: height, alignment: .leading)
+        .background(Color.primary.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5, 3]))
+                .foregroundStyle(Color.primary.opacity(0.12))
+        )
+    }
+
     /// 一个可拖的边界手柄：视觉是 5px 竖条，命中区放宽到 14px
     private func handleView(id: SegmentID, x: Double, height: CGFloat) -> some View {
         ZStack {
@@ -815,7 +853,6 @@ struct TimelineBar: View {
                 onDragChanged?(id, model.clamp(stepped, for: id))
                 dragFrozen = nil
                 hitLimit = nil
-                onDragEnded?()
             }
     }
 
@@ -861,7 +898,9 @@ struct TimelineBar: View {
                         .lineLimit(1)
                 }
                 if seg.width >= 46 {
-                    Text(String(format: "%.2fs", seg.duration))
+                    // 正片动辄 40 分钟，显示成 2412.00s 没人看得懂，用 mm:ss
+                    Text(seg.duration >= 60 ? humanDuration(seg.duration)
+                                           : String(format: "%.2fs", seg.duration))
                         .font(.system(size: 10, design: .rounded))
                         .monospacedDigit()
                 }
@@ -1190,7 +1229,7 @@ struct ExtractView: View {
     }
 }
 
-// MARK: - 板块: 封面与结尾（时间线）
+// MARK: - 板块 2: 封面与结尾（时间线）
 
 struct ComposeView: View {
     // 文件列表用新 key（旧 key 在 onAppear 迁移一次）
@@ -1216,6 +1255,8 @@ struct ComposeView: View {
     @AppStorage("fxt_endVideos") private var legacyEndVideos = ""
     @AppStorage("fxt_insVideos") private var legacyInsVideos = ""
     @AppStorage("fxt_insCovers") private var legacyInsCovers = ""
+    /// 旧「结尾处理」板块自己也有一份封面列表，只用那个板块的用户全靠它
+    @AppStorage("fxt_endCovers") private var legacyEndCovers = ""
 
     @State private var running = false
     @State private var stopping = false
@@ -1306,11 +1347,13 @@ struct ComposeView: View {
                 }
 
                 // 3. 时间线
+                // 高度随内容：结尾关掉 / 空状态时行 2 不显示，固定 220 会留一大块空白
                 GeometryReader { geo in
                     TimelineBar(model: timeline, width: max(geo.size.width, 240),
-                                onDragChanged: applyDrag, onDragEnded: {})
+                                onDragChanged: applyDrag,
+                                hasVideo: !videos.isEmpty)
                 }
-                .frame(height: 220)
+                .frame(minHeight: 150)
 
                 // 4. 结尾开关 + 时间轴参数
                 Card {
@@ -1398,19 +1441,21 @@ struct ComposeView: View {
                         .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1)))
                         .disabled(running || videos.isEmpty)
                     }
-                    if endingOn {
-                        HStack(spacing: 10) {
-                            FieldLabel("slider.horizontal.3", "输出体积")
-                            Picker("", selection: $sizeMode) {
-                                ForEach(SizeMode.allCases, id: \.rawValue) { m in
-                                    Text(m.label).tag(m.rawValue)
-                                }
+                    // 输出体积两条路径都用（只插封面走 insertCoverToVideo 也读它），
+                    // 所以不能跟着结尾开关一起隐藏
+                    HStack(spacing: 10) {
+                        FieldLabel("slider.horizontal.3", "输出体积")
+                        Picker("", selection: $sizeMode) {
+                            ForEach(SizeMode.allCases, id: \.rawValue) { m in
+                                Text(m.label).tag(m.rawValue)
                             }
-                            .pickerStyle(.segmented).labelsHidden().frame(width: 160)
-                            .disabled(running)
-                            Text(currentSize.hint).font(.system(size: 10.5)).foregroundStyle(.tertiary)
-                            Spacer()
                         }
+                        .pickerStyle(.segmented).labelsHidden().frame(width: 160)
+                        .disabled(running)
+                        Text(currentSize.hint).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                        Spacer()
+                    }
+                    if endingOn {
                         HStack(spacing: 10) {
                             FieldLabel("gauge", "编码速度")
                             Picker("", selection: $encSpeed) {
@@ -1505,12 +1550,17 @@ struct ComposeView: View {
 
     // MARK: 迁移与探测
 
-    /// 旧板块的文件列表搬过来一次
+    /// 旧板块的文件列表搬过来一次。
+    /// 两个旧板块各有一份封面列表，都得搬 —— 只用「结尾处理」的用户若只搬
+    /// `fxt_insCovers`，封面列表会是空的，点开始后静默降级成「只做结尾、不加封面」。
     private func migrateLegacyFiles() {
-        guard videosRaw.isEmpty else { return }
-        if !legacyEndVideos.isEmpty { videosRaw = legacyEndVideos }
-        else if !legacyInsVideos.isEmpty { videosRaw = legacyInsVideos }
-        if coversRaw.isEmpty, !legacyInsCovers.isEmpty { coversRaw = legacyInsCovers }
+        if videosRaw.isEmpty {
+            if !legacyEndVideos.isEmpty { videosRaw = legacyEndVideos }
+            else if !legacyInsVideos.isEmpty { videosRaw = legacyInsVideos }
+        }
+        guard coversRaw.isEmpty else { return }
+        if !legacyInsCovers.isEmpty { coversRaw = legacyInsCovers }
+        else if !legacyEndCovers.isEmpty { coversRaw = legacyEndCovers }
     }
 
     /// 只 probe 第一个视频：时长与 fps（封面时长 = 1 帧）
@@ -1550,14 +1600,6 @@ struct ComposeView: View {
     }
 
     // MARK: 输出目录
-
-    private func currentOutDir(for video: String) -> String {
-        let custom = outDirCustom.trimmingCharacters(in: .whitespaces)
-        if !custom.isEmpty { return custom }
-        let folder = endingOn ? "加结尾" : "加封面"
-        return URL(fileURLWithPath: video).deletingLastPathComponent()
-            .appendingPathComponent(folder).path
-    }
 
     private var effectiveOutDir: String? {
         let custom = outDirCustom.trimmingCharacters(in: .whitespaces)
@@ -1654,7 +1696,8 @@ struct ComposeView: View {
                     .appendingPathComponent(folder).path }) {
                 try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true)
             }
-        } else {
+        } else if !list.isEmpty {
+            // 没选视频就别建目录，否则退出后留一个空文件夹
             try? FileManager.default.createDirectory(atPath: customDir, withIntermediateDirectories: true)
         }
 
@@ -1774,7 +1817,7 @@ struct ComposeView: View {
     }
 }
 
-// MARK: - 板块 4: 整理归档（短剧整理助手：命名模板 + 分类夹归档 + 撤销 + CSV）
+// MARK: - 板块 3: 整理归档（短剧整理助手：命名模板 + 分类夹归档 + 撤销 + CSV）
 struct OrganizerView: View {
     @State private var folderURL: URL?
     @State private var title: String = ""
@@ -2205,7 +2248,7 @@ struct OrganizerView: View {
     }
 }
 
-// MARK: - 板块 5：关于与更新
+// MARK: - 板块 4: 关于与更新
 
 struct AboutView: View {
     @EnvironmentObject private var updates: UpdateCenter

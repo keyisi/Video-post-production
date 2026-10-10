@@ -1454,7 +1454,20 @@ struct TimelineModel {
 
     /// 按段钳制。范围与 ffmpeg 的前置校验对齐：
     /// `dur > fadeOut + 0.1` → 渐白上限 = sourceDuration - 0.1
+    /// 每段的下限，NaN/inf 兜底与越界钳制共用
+    func lowerBound(for id: SegmentID) -> Double {
+        switch id {
+        case .fadeOut: return 0.05
+        case .whiteHold: return 0
+        case .fadeIn: return 0.05
+        case .freeze: return 0.1
+        case .cover, .source, .ending: return 0
+        }
+    }
+
     func clamp(_ value: Double, for id: SegmentID) -> Double {
+        // NaN / inf 能穿透 min(max(...)) 直达 ffmpeg 滤镜串，这里一律先兜底
+        guard value.isFinite else { return lowerBound(for: id) }
         switch id {
         case .fadeOut:
             let upper = sourceDuration > 0 ? max(0.05, sourceDuration - 0.1) : 10
@@ -1482,7 +1495,14 @@ struct TimelineModel {
 
     // MARK: 布局
 
-    private static let padding: Double = 12
+    /// 轨道左右各留的空白（像素）。View 侧算「秒/像素」必须用同一个值，
+    /// 否则拖拽换算与布局会漂——所以暴露成静态方法而不是让 App.swift 再写一遍 24。
+    static let padding: Double = 12
+
+    /// 可用宽度（扣掉左右留白），拖拽换算与布局共用它
+    static func usableWidth(_ width: Double) -> Double {
+        max(width - padding * 2, 1)
+    }
     private static let coverWidth: Double = 10
     private static let endingWidth: Double = 60
 
@@ -1552,6 +1572,11 @@ struct LaidOutSegment {
 
 /// 板块从 5 个减到 4 个后的 tag 映射（旧 1/2 合并为「封面与结尾」，旧 3→2，旧 4→3）。
 /// 不做映射的话，升级前停在「整理归档」「关于与更新」的用户会看到空白页。
+///
+/// ⚠️ 本函数**不是幂等的**（`remapSection(2) == 1`、`remapSection(3) == 2`），
+/// 只能用于「旧 5 项 tag → 新 4 项 tag」这一次性转换。对已经是新 tag 的值再跑一次，
+/// 会把用户所在板块再往下挪一格（2→1、3→2），逐次漂移直到永远停在「封面与结尾」。
+/// 调用方必须用 `migrateSection(_:alreadyMigrated:)` 而不是直接调它。
 func remapSection(_ old: Int) -> Int {
     switch old {
     case 0: return 0
@@ -1559,6 +1584,22 @@ func remapSection(_ old: Int) -> Int {
     case 3: return 2
     default: return 3
     }
+}
+
+/// 新导航的板块总数（用于越界钳制）
+let sectionCount = 4
+
+/// 一次性板块迁移：只在 `alreadyMigrated == false` 时做 5→4 的错位映射，
+/// 之后一律不再映射（仅把越界值钳回合法范围）。
+///
+/// 抽出来是为了让「迁移只跑一次」这件事可被单测覆盖 —— 幂等性如果只靠调用方
+/// 自觉，测试就只会断言 `remapSection(3) == 2` 这种迁移后的正确值，反而把
+/// 非幂等这个 bug 钉成"正确行为"。
+func migrateSection(_ stored: Int, alreadyMigrated: Bool) -> Int {
+    if alreadyMigrated {
+        return min(max(stored, 0), sectionCount - 1)
+    }
+    return remapSection(stored)
 }
 
 // ---------- CLI 测试入口 ----------

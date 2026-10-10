@@ -163,12 +163,36 @@ struct TimelineModelTests {
         // 12. Review Focus #4：只插封面时文件名不变、只多 1 帧
         check(endingOffUsesInsertCover(), "testEndingOffUsesInsertCover")
 
-        // 13. Review Focus #5：板块 5→4 后的 fxt_section 错位映射
+        // 13. Review Focus #5：板块 5→4 后的 fxt_section 错位映射（首次迁移的值）
         check(remapSection(0) == 0, "testSectionRemap0")
         check(remapSection(1) == 1 && remapSection(2) == 1, "testSectionRemapCoverEnding")
         check(remapSection(3) == 2, "testSectionRemapOrganizer")
         check(remapSection(4) == 3, "testSectionRemapAbout")
         check(remapSection(99) == 3, "testSectionRemapOutOfRange")
+
+        // 14. 迁移只跑一次：已迁移过的值再跑必须原地不动（remapSection 本身非幂等，
+        //     靠 migrateSection 的 alreadyMigrated 开关保证稳定）
+        for old in [0, 1, 2, 3, 4, 99] {
+            let once = migrateSection(old, alreadyMigrated: false)
+            let twice = migrateSection(once, alreadyMigrated: true)
+            check(twice == once, "testSectionMigrateStable_\(old)")
+        }
+        check(migrateSection(2, alreadyMigrated: true) == 2, "testSectionMigrated2StaysOrganizer")
+        check(migrateSection(3, alreadyMigrated: true) == 3, "testSectionMigrated3StaysAbout")
+        check(migrateSection(99, alreadyMigrated: true) == 3, "testSectionMigratedClampHigh")
+        check(migrateSection(-5, alreadyMigrated: true) == 0, "testSectionMigratedClampLow")
+
+        // 15. NaN / inf 不得穿透 clamp 直达 ffmpeg 滤镜串
+        var nm = TimelineModel()
+        nm.sourceDuration = 40
+        for id in [SegmentID.fadeOut, .whiteHold, .fadeIn, .freeze] {
+            check(nm.clamp(Double.nan, for: id).isFinite, "testClampNaN_\(id.rawValue)")
+            check(nm.clamp(Double.infinity, for: id).isFinite, "testClampInf_\(id.rawValue)")
+            check(nm.clamp(-Double.infinity, for: id).isFinite, "testClampNegInf_\(id.rawValue)")
+        }
+
+        // 16. 布局的留白常量：View 侧 secPerPx 与 model.layout 必须用同一个可用宽度
+        check(TimelineModel.usableWidth(600) == 576, "testUsableWidth")
 
         print(failures == 0 ? "--- ALL PASS ---" : "--- \(failures) FAILED ---")
         exit(failures == 0 ? 0 : 1)

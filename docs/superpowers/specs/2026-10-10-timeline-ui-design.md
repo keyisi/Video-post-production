@@ -255,10 +255,16 @@ let px = duration / secPerPx              // 段宽
   `fxt_endOverwrite`、`fxt_endOutDir`、`fxt_endAFade`、`fxt_endAFadeDur`、`fxt_endSpeed`、
   `fxt_sizeMode` —— 语义未变，用户升级后无需重设
 - **文件列表用新 key**：`fxt_compVideos` / `fxt_compCovers`；首次启动做一次性迁移，
-  若新 key 为空且 `fxt_endVideos` / `fxt_insVideos` 有值，搬过来
-- **新增 key**：`fxt_compEndingOn`（结尾开关，默认 true）
+  若新 key 为空且 `fxt_endVideos` / `fxt_insVideos` 有值，搬过来；
+  封面列表有两个旧来源（`fxt_insCovers` 和旧「结尾处理」自己的 `fxt_endCovers`），
+  只搬前者会让纯「结尾处理」用户静默降级成「只做结尾、不加封面」
+- **新增 key**：`fxt_compEndingOn`（结尾开关，默认 true）、
+  `fxt_sectionRemapped`（板块迁移一次性开关，默认 false）
 - **`fxt_section` 错位修正**：`ContentView.onAppear` 里做一次映射
-  旧 0→0、旧 1→1、旧 2→1、旧 3→2、旧 4→3。否则升级后侧边栏会指向空白页
+  旧 0→0、旧 1→1、旧 2→1、旧 3→2、旧 4→3。否则升级后侧边栏会指向空白页。
+  **该映射必须只跑一次**——`remapSection` 非幂等（旧 3→2、旧 2→1 恰与新 tag 语义
+  重叠），每次启动都跑会把用户所在板块逐次往下漂移，最终永远停在「封面与结尾」。
+  实现为 `migrateSection(_:alreadyMigrated:)`，配「迁移后再跑必须原地不动」的稳定性断言
 - **旧 key 保留不删**：`fxt_insVideos` / `fxt_insCovers` / `fxt_insOutDir` /
   `fxt_endLocked` 不再读写，但保留定义以便回退旧版本时设置还在
 - **CLI 不受影响**：`main.swift` 的 `--cover` / `--ending` 参数与 `Logic.swift` 引擎不变

@@ -2,7 +2,7 @@
 
 一款为短剧/批量视频后期处理打造的 macOS 原生工具（SwiftUI + 内置 ffmpeg），把「抽帧、封面与结尾、整理归档」三件事装进一个 App。
 
-![Version](https://img.shields.io/badge/version-3.18.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
+![Version](https://img.shields.io/badge/version-3.18.1-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
 
 ![Release](https://img.shields.io/badge/release-latest-green)
 
