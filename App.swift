@@ -1251,6 +1251,8 @@ struct ComposeView: View {
     @AppStorage("fxt_endAFadeDur") private var audioFadeDurText = "0.5"
     @AppStorage("fxt_endSpeed") private var encSpeed = EncodeSpeed.fast.rawValue
     @AppStorage("fxt_sizeMode") private var sizeMode = SizeMode.match.rawValue
+    /// 封面缩放：1=完整显示（补黑边），>1 放大、超出后居中裁切，<1 缩小留更多黑边
+    @AppStorage("fxt_coverZoom") private var coverZoom: Double = 1.0
     // 迁移用的旧 key（只读一次）
     @AppStorage("fxt_endVideos") private var legacyEndVideos = ""
     @AppStorage("fxt_insVideos") private var legacyInsVideos = ""
@@ -1267,6 +1269,11 @@ struct ComposeView: View {
     @State private var sourceDuration: Double = 0
     @State private var coverFrame: Double = 1.0 / 24
     @State private var probed = false
+    /// 第一个视频的画布尺寸 + 第一张匹配封面的像素尺寸（用于算「铺满」需要放大多少）
+    @State private var canvasW: Int = 0
+    @State private var canvasH: Int = 0
+    @State private var coverPixelW: Int = 0
+    @State private var coverPixelH: Int = 0
 
     private var currentSpeed: EncodeSpeed { EncodeSpeed(rawValue: encSpeed) ?? .fast }
     private var currentSize: SizeMode { SizeMode(rawValue: sizeMode) ?? .match }
@@ -1275,6 +1282,30 @@ struct ComposeView: View {
     private var sfxExists: Bool { !sfxPath.isEmpty && FileManager.default.fileExists(atPath: sfxPath) }
     private var matchedCount: Int {
         videos.filter { findCover(forVideo: $0, covers: covers) != nil }.count
+    }
+
+    /// 「刚好铺满、不留黑边」需要的缩放倍数（尺寸未知时为 nil）
+    private var fillZoomValue: Double? {
+        guard canvasW > 0, canvasH > 0, coverPixelW > 0, coverPixelH > 0 else { return nil }
+        return coverFillZoom(imageW: coverPixelW, imageH: coverPixelH,
+                             canvasW: canvasW, canvasH: canvasH)
+    }
+
+    private var coverZoomHint: String {
+        let pct = Int((coverZoom * 100).rounded())
+        guard let fill = fillZoomValue else {
+            return "100% = 完整显示；放大后超出画面的部分会被居中裁掉"
+        }
+        let fillPct = Int((fill * 100).rounded())
+        if coverZoom >= fill - 0.005 { return "已铺满（\(pct)%）：超出画面的部分居中裁掉" }
+        if coverZoom > 1.005 { return "放大到 \(pct)%：仍有黑边，到 \(fillPct)% 刚好铺满" }
+        if coverZoom < 0.995 { return "缩小到 \(pct)%：四周黑边更多" }
+        return "100%：完整显示、不足处补黑边（铺满需 \(fillPct)%）"
+    }
+
+    /// 1% 步进微调缩放
+    private func stepZoom(_ delta: Int) {
+        coverZoom = min(max(((coverZoom * 100).rounded() + Double(delta)) / 100, 0.5), 3.0)
     }
 
     private var timeline: TimelineModel {
@@ -1308,6 +1339,7 @@ struct ComposeView: View {
         s.audioFade = audioFadeOn ? max(0.05, parseNum(audioFadeDurText, fallback: 0.5)) : 0
         s.speed = currentSpeed
         s.sizeMode = currentSize
+        s.coverZoom = min(max(coverZoom, 0.5), 3.0)
         return s
     }
 
@@ -1344,6 +1376,78 @@ struct ComposeView: View {
                     .background(Theme.card)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08)))
+                }
+
+                // 封面缩放（两条执行路径共用）
+                Card {
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack(spacing: 10) {
+                            FieldLabel("arrow.up.left.and.arrow.down.right", "封面缩放")
+                            Slider(value: $coverZoom, in: 0.5...3.0, step: 0.01)
+                                .frame(width: 210)
+                                .disabled(running)
+                            // 1% 步进微调：滑块拖不准 101%/102%，用 ± 按钮补
+                            Button { stepZoom(-1) } label: {
+                                Image(systemName: "minus").font(.system(size: 9, weight: .bold))
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 7).padding(.vertical, 5)
+                            .background(Theme.card)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .overlay(RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.primary.opacity(0.1)))
+                            .disabled(running || coverZoom <= 0.5)
+                            .help("缩小 1%")
+                            Text("\(Int((coverZoom * 100).rounded()))%")
+                                .font(.system(size: 11.5, weight: .semibold).monospacedDigit())
+                                .frame(width: 44, alignment: .center)
+                            Button { stepZoom(1) } label: {
+                                Image(systemName: "plus").font(.system(size: 9, weight: .bold))
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 7).padding(.vertical, 5)
+                            .background(Theme.card)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .overlay(RoundedRectangle(cornerRadius: 6)
+                                .stroke(Color.primary.opacity(0.1)))
+                            .disabled(running || coverZoom >= 3.0)
+                            .help("放大 1%")
+                            if let fill = fillZoomValue {
+                                Button {
+                                    // 向上取整到 1%，保证真的不留黑边
+                                    coverZoom = min(max((fill * 100).rounded(.up) / 100, 0.5), 3.0)
+                                } label: {
+                                    Label("铺满", systemImage: "rectangle.inset.filled")
+                                        .font(.system(size: 11))
+                                }
+                                .buttonStyle(.plain)
+                                .padding(.horizontal, 9).padding(.vertical, 5)
+                                .background(Theme.card)
+                                .clipShape(RoundedRectangle(cornerRadius: 7))
+                                .overlay(RoundedRectangle(cornerRadius: 7)
+                                    .stroke(Color.primary.opacity(0.1)))
+                                .disabled(running)
+                                .help("放大到刚好填满画面、不留黑边")
+                            }
+                            Button {
+                                coverZoom = 1.0
+                            } label: {
+                                Text("复位").font(.system(size: 11))
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 9).padding(.vertical, 5)
+                            .background(Theme.card)
+                            .clipShape(RoundedRectangle(cornerRadius: 7))
+                            .overlay(RoundedRectangle(cornerRadius: 7)
+                                .stroke(Color.primary.opacity(0.1)))
+                            .disabled(running)
+                            .help("回到 100%（完整显示，补黑边）")
+                            Spacer()
+                        }
+                        Text(coverZoomHint)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
 
                 // 3. 时间线
@@ -1546,6 +1650,7 @@ struct ComposeView: View {
             refreshProbe()
         }
         .onChange(of: videosRaw) { _ in refreshProbe() }
+        .onChange(of: coversRaw) { _ in refreshProbe() }
     }
 
     // MARK: 迁移与探测
@@ -1563,18 +1668,27 @@ struct ComposeView: View {
         else if !legacyEndCovers.isEmpty { coversRaw = legacyEndCovers }
     }
 
-    /// 只 probe 第一个视频：时长与 fps（封面时长 = 1 帧）
+    /// 只 probe 第一个视频：时长、fps、画布尺寸，以及第一张匹配封面的像素尺寸
+    /// （后者用于算「铺满」需要放大多少）
     private func refreshProbe() {
         guard let first = videos.first else {
-            sourceDuration = 0; coverFrame = 1.0 / 24; probed = false; return
+            sourceDuration = 0; coverFrame = 1.0 / 24; probed = false
+            canvasW = 0; canvasH = 0; coverPixelW = 0; coverPixelH = 0
+            return
         }
+        let cover = findCover(forVideo: first, covers: covers)
         DispatchQueue.global(qos: .utility).async {
+            let info = probeVideoInfo(first)
             let dur = probeDuration(first) ?? 0
-            let fps = probeVideoInfo(first)?.2 ?? 24
+            let fps = info?.2 ?? 24
+            let cw = info?.0 ?? 0, ch = info?.1 ?? 0
+            let cs = cover.flatMap { probeImageSize($0) }
             DispatchQueue.main.async {
                 sourceDuration = dur
                 coverFrame = fps > 0 ? 1.0 / fps : 1.0 / 24
                 probed = dur > 0
+                canvasW = cw; canvasH = ch
+                coverPixelW = cs?.0 ?? 0; coverPixelH = cs?.1 ?? 0
             }
         }
     }
@@ -1714,6 +1828,9 @@ struct ComposeView: View {
         } else {
             head += "：\(coverList.count) 张封面按集数匹配，体积 \(s.sizeMode.label)"
         }
+        if abs(s.coverZoom - 1.0) > 0.001 {
+            head += "，封面缩放 \(Int((s.coverZoom * 100).rounded()))%"
+        }
         head += customDir.isEmpty ? "，输出到每个视频旁的「\(folder)」文件夹" : "，输出到 \(customDir)"
         logs = [head]
 
@@ -1743,7 +1860,7 @@ struct ComposeView: View {
                     let cName = URL(fileURLWithPath: cover).lastPathComponent
                     let t0 = Date()
                     let ok = insertCoverToVideo(video, coverPath: cover, outputDir: outDir,
-                                                sizeMode: size) { msg in
+                                                sizeMode: size, coverZoom: s.coverZoom) { msg in
                         DispatchQueue.main.async { logs.append("[\(vi+1)/\(list.count)] \(msg)") }
                     }
                     if RunControl.shared.isCancelled { stopped = true; break }

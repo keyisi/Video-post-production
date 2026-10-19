@@ -903,10 +903,89 @@ func extractCover(_ videoPath: String, outputDir: String, outName: String,
     return .fail("取封面失败: \(String(r.err.suffix(200)))")
 }
 
+// ---------- 封面缩放: 在「等比适应画面」的基础上再按 zoom 放大/缩小 ----------
+
+/// 封面帧缩放后的布局
+struct CoverLayout {
+    var targetW: Int = 0     // 缩放后封面的像素宽
+    var targetH: Int = 0
+    /// true = 已超过画面 → 居中裁切；false = 小于画面 → 居中补黑边
+    var crops: Bool = false
+}
+
+/// zoom = 1 即旧行为（等比适应画面、不足处补黑边）
+/// zoom > 1 放大：某一维超过画面后改为居中裁切，继续加大就是「放大裁切」
+/// zoom < 1 缩小：四周黑边更多
+func coverLayout(imageW: Int, imageH: Int, canvasW: Int, canvasH: Int,
+                 zoom: Double) -> CoverLayout {
+    guard imageW > 0, imageH > 0, canvasW > 0, canvasH > 0 else { return CoverLayout() }
+    let z = zoom.isFinite ? max(zoom, 0.05) : 1.0
+    // fit: 让封面「完整显示」所需的缩放系数（>1 表示封面比画面小，需要放大才填满）
+    let fit = min(Double(canvasW) / Double(imageW), Double(canvasH) / Double(imageH))
+    let tw = Double(imageW) * fit * z
+    let th = Double(imageH) * fit * z
+    // 只有「真的超出」才裁切：等于画布（刚好贴合）仍走补黑边分支，
+    // 否则 th == canvasH 会被误判成裁切，crop 从更小的输入里取画面会出黑图
+    let crops = tw > Double(canvasW) + 0.5 || th > Double(canvasH) + 0.5
+    // yuv420p 要求偶数尺寸；裁切分支还必须 ≥ 画面，否则 crop 会直接失败
+    let cw = canvasW - canvasW % 2
+    let ch = canvasH - canvasH % 2
+    let ew = crops ? Int(ceil(tw / 2.0) * 2.0) : Int(floor(tw / 2.0) * 2.0)
+    let eh = crops ? Int(ceil(th / 2.0) * 2.0) : Int(floor(th / 2.0) * 2.0)
+    return CoverLayout(targetW: crops ? max(ew, cw) : max(ew, 2),
+                       targetH: crops ? max(eh, ch) : max(eh, 2),
+                       crops: crops)
+}
+
+/// 刚好铺满画面（不留黑边）所需的 zoom；封面尺寸未知时返回 nil
+func coverFillZoom(imageW: Int, imageH: Int, canvasW: Int, canvasH: Int) -> Double? {
+    guard imageW > 0, imageH > 0, canvasW > 0, canvasH > 0 else { return nil }
+    let fit = min(Double(canvasW) / Double(imageW), Double(canvasH) / Double(imageH))
+    guard fit > 0 else { return nil }
+    return 1.0 / fit
+}
+
+/// 读取图片（封面）的像素尺寸
+func probeImageSize(_ path: String) -> (Int, Int)? {
+    let r = runTool(ffprobeBin(), ["-v", "error", "-select_streams", "v:0",
+                                   "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                                   path])
+    guard r.code == 0 else { return nil }
+    let line = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        .components(separatedBy: "\n").first ?? ""
+    let parts = line.components(separatedBy: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+    guard parts.count >= 2, let w = Int(parts[0]), let h = Int(parts[1]),
+          w > 0, h > 0 else { return nil }
+    return (w, h)
+}
+
+/// 封面静帧滤镜：先按 layout 缩放，再居中补黑边或裁切
+func coverStillFilter(imageSize: (Int, Int)?, canvasW: Int, canvasH: Int,
+                      fps: Double, zoom: Double) -> String {
+    let cw = canvasW - canvasW % 2
+    let ch = canvasH - canvasH % 2
+    let tail = "setsar=1,fps=\(fps)"
+    if let (iw, ih) = imageSize {
+        let L = coverLayout(imageW: iw, imageH: ih, canvasW: cw, canvasH: ch, zoom: zoom)
+        if L.targetW > 0 && L.targetH > 0 {
+            if L.crops {
+                return "scale=\(L.targetW):\(L.targetH),crop=\(cw):\(ch)," + tail
+            }
+            return "scale=\(L.targetW):\(L.targetH)," +
+                   "pad=\(cw):\(ch):(ow-iw)/2:(oh-ih)/2:color=black," + tail
+        }
+    }
+    // 探测失败/尺寸异常：退回旧行为（等比适应 + 黑边）
+    return "scale=\(cw):\(ch):force_original_aspect_ratio=decrease," +
+           "pad=\(cw):\(ch):(ow-iw)/2:(oh-ih)/2:color=black," + tail
+}
+
 // ---------- 插入封面: 封面按集数匹配视频, 插到视频最开头占 1 帧 ----------
 
 func insertCoverToVideo(_ videoPath: String, coverPath: String, outputDir: String,
                         sizeMode: SizeMode = .match,
+                        coverZoom: Double = 1.0,
                         log: @escaping (String) -> Void) -> Bool {
     let fm = FileManager.default
     guard fm.fileExists(atPath: videoPath) else {
@@ -926,9 +1005,10 @@ func insertCoverToVideo(_ videoPath: String, coverPath: String, outputDir: Strin
     let stillDur = 1.0 / fps
     let ms = max(Int(stillDur * 1000), 1)
 
-    // 封面等比缩放居中 + 与原视频 concat（视频轨）；原音轨延迟 stillDur
-    var filter = "[0:v]scale=\(w):\(h):force_original_aspect_ratio=decrease," +
-        "pad=\(w):\(h):(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=\(fps)[s];" +
+    // 封面按 zoom 缩放居中 + 与原视频 concat（视频轨）；原音轨延迟 stillDur
+    var filter = "[0:v]" + coverStillFilter(imageSize: probeImageSize(coverPath),
+                                            canvasW: w, canvasH: h,
+                                            fps: fps, zoom: coverZoom) + "[s];" +
         "[s][1:v]concat=n=2:v=1:a=0[v]"
     if hasAudio {
         filter += ";[1:a]adelay=\(ms):all=1[a]"
@@ -1068,6 +1148,7 @@ struct JobSettings {
     var audioFade: Double = 0        // 原视频音频淡出时长（0=不淡化）
     var speed: EncodeSpeed = .fast   // 编码速度档位
     var sizeMode: SizeMode = .match  // 输出体积档位（默认跟随原片）
+    var coverZoom: Double = 1.0      // 封面缩放（1=完整显示补黑边；>1 放大裁切；<1 缩小留边）
 }
 
 // 耗时格式化: 8.4 秒 / 1 分 23 秒 / 1 小时 02 分
@@ -1260,6 +1341,7 @@ enum EndingEngine {
     // 输入: 0=视频, 1=封面图(loop), 2=音效(可选)
 
     static func buildCombinedFilter(_ dur: Double, w: Int, h: Int, fps: Double,
+                                    coverPath: String,
                                     settings s: JobSettings, audio: Bool, useSFX: Bool) -> String {
         let t = timeline(s, sourceDuration: dur)
         let still = 1.0 / fps
@@ -1267,8 +1349,9 @@ enum EndingEngine {
         let grandTotal = t.total + still
         var fc = ""
         fc += "[0:v]split=2[v1][v2];"
-        fc += "[1:v]scale=\(w):\(h):force_original_aspect_ratio=decrease," +
-              "pad=\(w):\(h):(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=\(fps)[c];"
+        fc += "[1:v]" + coverStillFilter(imageSize: probeImageSize(coverPath),
+                                         canvasW: w, canvasH: h,
+                                         fps: fps, zoom: s.coverZoom) + "[c];"
         fc += String(format: "[v1]fade=t=out:st=%.3f:d=%.3f:color=white[segA];",
                      t.fadeOutStart, s.fadeOut)
         let pad = s.whiteHold + s.fadeIn + s.freeze
@@ -1320,7 +1403,7 @@ enum EndingEngine {
               let dur = probeDuration(input), dur > s.fadeOut + 0.1 else { return nil }
         let sfx = s.sfxPath ?? ""
         let useSFX = !sfx.isEmpty && FileManager.default.fileExists(atPath: sfx)
-        let fc = buildCombinedFilter(dur, w: w, h: h, fps: fps,
+        let fc = buildCombinedFilter(dur, w: w, h: h, fps: fps, coverPath: cover,
                                      settings: s, audio: hasAudio(input), useSFX: useSFX)
         let out = outputURL(for: input, settings: s)
         guard out.path != input else { return nil }  // 防止顶掉源文件
@@ -1372,7 +1455,7 @@ enum EndingEngine {
         }
         let sfx = s.sfxPath ?? ""
         let useSFX = !sfx.isEmpty && FileManager.default.fileExists(atPath: sfx)
-        let fc = buildCombinedFilter(dur, w: w, h: h, fps: fps,
+        let fc = buildCombinedFilter(dur, w: w, h: h, fps: fps, coverPath: cover,
                                      settings: s, audio: hasAudio(input), useSFX: useSFX)
         try? FileManager.default.createDirectory(
             at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1606,21 +1689,24 @@ func migrateSection(_ stored: Int, alreadyMigrated: Bool) -> Int {
 
 func cliMain() {
     let args = Array(CommandLine.arguments.dropFirst())
-    // 插封面: --insert <视频> <封面图> [-o 目录]
+    // 插封面: --insert <视频> <封面图> [-o 目录] [--zoom 1.5]
     if args.first == "--insert" {
         guard args.count >= 3 else {
-            print("用法: VideoPostCLI --insert <视频> <封面图> [-o 目录]"); exit(1)
+            print("用法: VideoPostCLI --insert <视频> <封面图> [-o 目录] [--zoom 1.5]"); exit(1)
         }
         var outDir: String? = nil
+        var zoom = 1.0
         var i = 3
         while i < args.count {
-            if args[i] == "-o" { i += 1; outDir = args[i] }
+            if args[i] == "-o", i + 1 < args.count { i += 1; outDir = args[i] }
+            else if args[i] == "--zoom", i + 1 < args.count { i += 1; zoom = Double(args[i]) ?? 1.0 }
             i += 1
         }
         let video = args[1]
         let dir = outDir ?? URL(fileURLWithPath: video).deletingLastPathComponent()
             .appendingPathComponent("加封面").path
-        let r = insertCoverToVideo(video, coverPath: args[2], outputDir: dir) { print($0) }
+        let r = insertCoverToVideo(video, coverPath: args[2], outputDir: dir,
+                                   coverZoom: zoom) { print($0) }
         print(r ? "OK: \(dir)" : "FAILED")
         exit(r ? 0 : 1)
     }
@@ -1676,7 +1762,7 @@ func cliMain() {
         }
     }
     // 结尾处理模式: --ending <视频或目录...> [--sfx 路径] [--fade-out 秒] [--hold 秒] [--fade-in 秒]
-    //              [--freeze 秒] [--sfx-offset 秒] [--afade 秒] [--speed fast|standard] [--size match|high] [--suffix 后缀] [-o 目录] [--overwrite] [--print-cmd]
+    //              [--freeze 秒] [--sfx-offset 秒] [--afade 秒] [--speed fast|standard] [--size match|high] [--suffix 后缀] [--cover-zoom 1.0] [-o 目录] [--overwrite] [--print-cmd]
     if args.first == "--ending" {
         var paths: [String] = []
         var s = JobSettings()
@@ -1708,6 +1794,7 @@ func cliMain() {
             case "--size": s.sizeMode = SizeMode(rawValue: need().lowercased()) ?? .match
             case "--print-cmd": printCmd = true
             case "--cover": coverArg = need()
+            case "--cover-zoom": s.coverZoom = Double(need()) ?? s.coverZoom
             default: paths.append(a)
             }
             i += 1

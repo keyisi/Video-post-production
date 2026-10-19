@@ -194,6 +194,39 @@ struct TimelineModelTests {
         // 16. 布局的留白常量：View 侧 secPerPx 与 model.layout 必须用同一个可用宽度
         check(TimelineModel.usableWidth(600) == 576, "testUsableWidth")
 
+        // 17. 封面缩放：1.0 = 完整显示补黑边；刚好贴合不能误判成裁切；超出才裁
+        let lay1 = coverLayout(imageW: 1080, imageH: 1920, canvasW: 1920, canvasH: 1080, zoom: 1.0)
+        check(lay1.crops == false, "testCoverZoom1NoCrop")
+        check(lay1.targetW == 606 && lay1.targetH == 1080, "testCoverZoom1Size")
+        if let fill = coverFillZoom(imageW: 1080, imageH: 1920, canvasW: 1920, canvasH: 1080) {
+            check(abs(fill - 1.7778) < 0.001, "testCoverFillZoom")
+        } else {
+            check(false, "testCoverFillZoom")
+        }
+        let layFill = coverLayout(imageW: 1080, imageH: 1920, canvasW: 1920, canvasH: 1080, zoom: 1.78)
+        check(layFill.crops == true, "testCoverZoomFillCrops")
+        check(layFill.targetW >= 1920 && layFill.targetH >= 1080, "testCoverZoomFillCoversCanvas")
+        let laySmall = coverLayout(imageW: 1080, imageH: 1920, canvasW: 1920, canvasH: 1080, zoom: 0.6)
+        check(laySmall.crops == false && laySmall.targetH < 1080, "testCoverZoomSmall")
+        // 横版封面塞进同尺寸画布：恰好贴合，仍应走补边（此处 pad 为 0）
+        let layExact = coverLayout(imageW: 1920, imageH: 1080, canvasW: 1920, canvasH: 1080, zoom: 1.0)
+        check(layExact.crops == false, "testCoverZoomExactFitNoCrop")
+        check(layExact.targetW == 1920 && layExact.targetH == 1080, "testCoverZoomExactSize")
+        // NaN / 负数不得产出非法尺寸
+        let layNaN = coverLayout(imageW: 1080, imageH: 1920, canvasW: 1920, canvasH: 1080, zoom: .nan)
+        check(layNaN.targetW > 0 && layNaN.targetH > 0, "testCoverZoomNaNSafe")
+        let layNeg = coverLayout(imageW: 1080, imageH: 1920, canvasW: 1920, canvasH: 1080, zoom: -3)
+        check(layNeg.targetW > 0 && layNeg.targetH > 0, "testCoverZoomNegativeSafe")
+        // 滤镜串：裁切分支才有 crop；补边分支必须有 pad + 黑边
+        let f1 = coverStillFilter(imageSize: (1080, 1920), canvasW: 1920, canvasH: 1080, fps: 25, zoom: 1.0)
+        check(f1.contains("pad=1920:1080") && !f1.contains("crop="), "testCoverFilterPad")
+        let f2 = coverStillFilter(imageSize: (1080, 1920), canvasW: 1920, canvasH: 1080, fps: 25, zoom: 1.78)
+        check(f2.contains("crop=1920:1080") && !f2.contains("pad="), "testCoverFilterCrop")
+        // 拿不到封面尺寸时退回旧行为，保证不会因为探测失败而编不出片
+        let f3 = coverStillFilter(imageSize: nil, canvasW: 1920, canvasH: 1080, fps: 25, zoom: 2.0)
+        check(f3.contains("force_original_aspect_ratio=decrease") && f3.contains("pad="),
+              "testCoverFilterFallback")
+
         print(failures == 0 ? "--- ALL PASS ---" : "--- \(failures) FAILED ---")
         exit(failures == 0 ? 0 : 1)
     }

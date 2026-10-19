@@ -2,7 +2,7 @@
 
 一款为短剧/批量视频后期处理打造的 macOS 原生工具（SwiftUI + 内置 ffmpeg），把「抽帧、封面与结尾、整理归档」三件事装进一个 App。
 
-![Version](https://img.shields.io/badge/version-3.18.1-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
+![Version](https://img.shields.io/badge/version-3.19.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
 
 ![Release](https://img.shields.io/badge/release-latest-green)
 
@@ -37,6 +37,7 @@
 - **结尾时间轴**：正片尾部放大铺满，**渐白以半透明叠在正片最后几秒上**，其后依次 全白 → 渐显 → 定格
 - **可拖拽**：拖动色块间的小竖条直接改时长，与下方数字输入框双向同步，松手自动对齐到 0.05 秒；拖到上限会停住并提示
 - 封面按集数自动配对（EP21 ↔ 封面21，上层文件夹名不参与匹配）
+- **封面缩放**：100% 完整显示（不足处补黑边）；往上调 101%、102%… 逐 1% 放大，超出画面的部分居中裁掉，调到「铺满」档刚好不留黑边；缩小则黑边更多。滑块粗调 + 「−/＋」1% 微调，一键「铺满」「复位」，两条执行路径（只插封面 / 封面+结尾一次编码）行为一致
 - 「处理结尾」开关关掉 = 只插封面，输出到「加封面」文件夹、文件名不变；开着 = 封面+结尾**一次编码完成**（少一遍转码），输出到「加结尾」文件夹
 - 🎵 音效（可加偏移）／🔊 原视频音频淡出／⚡ 编码速度／📦 输出体积（跟随原片或高质量）
 - ⏱ 实时进度 + 每集用时，处理中可随时停止（已完成保留，半成品清理）
