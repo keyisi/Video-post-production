@@ -10,6 +10,8 @@
 
 版本规则 `x.y.z`：新功能/大改动进 `y`（`z` 归 0，如 3.15.0），修 bug 或小调整只进 `z`（如 3.14.1）。
 
+最近一次发布：**v3.22.0**（2026-10-20）—— 封面 1% 等比缩放、原片归档（成片原地替换）、反推去片头片尾、文件与文件夹双入口导入、「仅片尾」模式。完整历史见 [Releases 更新日志](https://github.com/keyisi/Video-post-production/releases)。
+
 ## 功能板块
 
 五个板块常驻在窗口里，**左侧边栏切换** —— 切走再切回，已选文件、参数、日志、处理进度都还在。
@@ -91,7 +93,7 @@
 
 ```bash
 ./build.sh           # 一键构建 GUI App + CLI（推荐）
-./build.sh --test    # 顺便跑 TimelineModel 单测（53 条）
+./build.sh --test    # 顺便跑 TimelineModel 单测（120 条）
 ```
 
 脚本会固定带 `-target arm64-apple-macosx13.0` 编译，并在结束后用 `vtool` 复核两个二进制的 `minos` 必须是 13.0，不符直接失败退出 —— **不要手写编译命令**：swiftc 不带 `-target` 时部署目标会取编译机的系统版本（本机 macOS 27 → 产物要求 macOS 27），而 plist 里的 `LSMinimumSystemVersion` 只是门面，真正决定是否可加载的是 Mach-O 的 `minos`。
@@ -120,15 +122,30 @@ vtool -show-build "build/Video Post-Production.app/Contents/MacOS/VideoFrameTool
 
 # 撤销上次整理
 ./videopost-cli --undo
+
+# 只插封面，封面放大到 105% 铺满（不留黑边）
+./videopost-cli --insert EP01.mp4 封面/EP01.jpg --zoom 1.05 -o 输出/
+
+# 结尾 + 原片归档：原片进「原片」夹，成片用原文件名写回原位置（--suffix / -o 失效）
+./videopost-cli --ending 视频/ --cover 封面/ --archive --archive-folder 原片
+
+# 不加 --cover 就是「仅片尾」：只加片尾、完全不插封面
+./videopost-cli --ending 视频/ --hold 1.0 --freeze 1.0 --out 输出/
+
+# 反推：自动探测片尾白场，切掉片头封面帧与片尾，还原正片
+./videopost-cli --strip 成片/ --detect -o 正片/
+./videopost-cli --strip 成片.mp4 --drop-fade --head 0.04   # 连渐白一起切掉
 ```
 
 ## 项目结构
 
 ```
-├── App.swift        # SwiftUI 界面（四大板块 + 通用组件）
-├── Logic.swift      # 引擎：抽帧/封面/结尾(EndingEngine)/整理(DramaOrganizer)
-├── main.swift       # CLI 入口与路由
-├── screenshots/     # 四个板块的界面截图
+├── App.swift        # SwiftUI 界面（五个板块 + 通用组件）
+├── Logic.swift      # 引擎：抽帧/封面与结尾(EndingEngine)/反推(StripEngine)/整理(DramaOrganizer) + CLI 解析
+├── main.swift       # CLI 顶层入口（仅此文件允许顶层代码）
+├── build.sh         # 一键构建，固定 -target 并用 vtool 复核 minos
+├── tests/           # TimelineModelTests.swift（120 条断言，含封面缩放/归档/反推/导入/模式迁移）
+├── screenshots/     # 界面截图（抽帧、封面与结尾、整理归档、关于与更新）
 ├── 调试记录.md       # 每次排查/修复的归档（现象→根因→修复→验证）
 └── build/           # 现成的 App（内置 ffmpeg / ffprobe）
 ```
@@ -137,7 +154,12 @@ vtool -show-build "build/Video Post-Production.app/Contents/MacOS/VideoFrameTool
 
 ## 设计说明
 
-- 四个板块用 `ZStack` 常驻视图树，切换只改 `opacity / allowsHitTesting`，不销毁 View，因此 `@State` 内容不丢；非当前板块还会 `offset` 移出可视区，避免隐藏层抢占拖放落点
+- 五个板块用 `ZStack` 常驻视图树，切换只改 `opacity / allowsHitTesting`，不销毁 View，因此 `@State` 内容不丢；板块数量升级时靠 `migrateSection` 做一次性迁移，不会把老用户的最后停留位置挤走
+- **导入语义统一是「追加去重」**：文件与文件夹走同一个 `expandImport`（文件夹只扫一层、按扩展名过滤、`localizedStandardCompare` 排序），再由 `mergePaths` 追加；重新选择不会清掉已选内容，清空有独立的垃圾桶按钮
+- **反推**靠 `scale=64:36,signalstats,metadata=print` 一次性取全片逐帧 YAVG（3 分钟 1080p 约零点几秒），`analyzeEnding` 是纯函数：base 取中位数、`thr=peak-6` 找最后一段近白平台、`lo=base+3%` 继续向前找渐白起点；切点不在关键帧上，用 seek + 重编码保证帧级精确
+- **原片归档**先 `moveItem` 把原片搬进「原片」夹，再让成片以原文件名写回原位置；编码失败或中途停止会 `restoreSource` 搬回并清掉半成品，同名原片自动 `-1/-2` 去重，绝不覆盖
+- 非当前板块还会 `offset` 移出可视区，避免隐藏层抢占拖放落点；封面缩放用 `coverStillFilter` 统一算布局（`zoom=1` 为旧行为：适应 + 补黑边，超出则居中裁切，尺寸按偶数对齐），两条执行路径共用同一函数所以行为一致
+- 「处理」三选一存 `fxt_compMode`，旧的布尔开关由 `migrateComposeMode` 一次性幂等迁移，老用户设置不丢
 - 封面配对用 `episodeNumber(in:)`：**只解析文件名**（不看上层目录，避免「31-45导出」这类文件夹名污染集数），优先 `EPxx / 第N集` 标记，其次剔除 `(1)` 副本标记与分辨率/年份后取末位数字，最后做**集数精确相等**匹配
 - 设置通过 `@AppStorage`（UserDefaults，键前缀 `fxt_`）持久化，重开 App 自动恢复
 - 内置 ffmpeg 定位优先级：App 包内 Resources → `~/.local/bin` → `/opt/homebrew/bin` 等系统路径
