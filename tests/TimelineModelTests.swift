@@ -398,6 +398,75 @@ struct TimelineModelTests {
         }
         try? fm2.removeItem(atPath: tmp4)
 
+        // ---------- 导入：文件 / 文件夹展开 ----------
+        let fm3 = FileManager.default
+        let imp = NSTemporaryDirectory() + "tl_import"
+        try? fm3.removeItem(atPath: imp)
+        try? fm3.createDirectory(atPath: imp, withIntermediateDirectories: true)
+        try? fm3.createDirectory(atPath: imp + "/sub", withIntermediateDirectories: true)
+        for n in ["EP01.mp4", "EP02.MOV", "EP03.jpg", "note.txt", ".hidden.mp4"] {
+            fm3.createFile(atPath: imp + "/" + n, contents: Data("x".utf8))
+        }
+        fm3.createFile(atPath: imp + "/sub/EP09.mp4", contents: Data("x".utf8))
+        let root = URL(fileURLWithPath: imp)
+
+        let vids = expandImport([root], wanted: videoImportExts)
+        check(vids.count == 2, "testExpandFolderOnlyTopLayer")          // 不递归 sub，跳过 jpg/txt/隐藏文件
+        check(vids.allSatisfy { $0.lowercased().hasSuffix(".mp4") || $0.lowercased().hasSuffix(".mov") },
+              "testExpandFolderExtensionFilter")
+        check(vids.first?.hasSuffix("EP01.mp4") ?? false, "testExpandFolderSorted")  // 字典序，EP01 在前
+        check(expandImport([root], wanted: imageExts).count == 1, "testExpandFolderImage")
+        check(expandImport([root], wanted: []).count == 4, "testExpandFolderNoFilter")  // 空集=全收（仍跳过隐藏/子目录）
+        // 直接选文件：不命中扩展名的被滤掉；重复选同一路径只留一份
+        let one = URL(fileURLWithPath: imp + "/EP02.MOV")
+        check(expandImport([one, one], wanted: videoImportExts).count == 1, "testExpandFileDedup")
+        check(expandImport([URL(fileURLWithPath: imp + "/note.txt")], wanted: videoImportExts).isEmpty,
+              "testExpandFileFiltered")
+        // 混合：一个文件夹 + 一个文件
+        check(expandImport([root, URL(fileURLWithPath: imp + "/sub/EP09.mp4")],
+                           wanted: videoImportExts).count == 3, "testExpandMixed")
+
+        check(mergePaths(["a", "b"], ["b", "c"]) == ["a", "b", "c"], "testMergePathsDedup")
+        check(mergePaths(["a"], []) == ["a"], "testMergePathsAppendNothing")
+        check(mergePaths([], ["x", "y"]) == ["x", "y"], "testMergePathsFromEmpty")
+        try? fm3.removeItem(atPath: imp)
+
+        // ---------- 处理模式：仅封面 / 仅片尾 / 封面+片尾 ----------
+        check(ComposeMode.coverOnly.withEnding == false && ComposeMode.coverOnly.withCover, "testModeCoverOnly")
+        check(ComposeMode.endingOnly.withEnding && ComposeMode.endingOnly.withCover == false, "testModeEndingOnly")
+        check(ComposeMode.both.withEnding && ComposeMode.both.withCover, "testModeBoth")
+        check(ComposeMode.coverOnly.outFolder == "加封面", "testModeOutFolderCover")
+        check(ComposeMode.endingOnly.outFolder == "加结尾", "testModeOutFolderEnding")
+        // 迁移：旧 endingOn=true → 封面+片尾；false → 仅封面
+        check(migrateComposeMode("", legacyEndingOn: true, alreadyMigrated: false) == ComposeMode.both.rawValue,
+              "testModeMigrateFromOn")
+        check(migrateComposeMode("", legacyEndingOn: false, alreadyMigrated: false) == ComposeMode.coverOnly.rawValue,
+              "testModeMigrateFromOff")
+        // 已迁移：原样返回，不再被旧布尔值改写（幂等）
+        check(migrateComposeMode(ComposeMode.endingOnly.rawValue, legacyEndingOn: true, alreadyMigrated: true)
+              == ComposeMode.endingOnly.rawValue, "testModeMigrateIdempotent")
+        check(migrateComposeMode("垃圾值", legacyEndingOn: false, alreadyMigrated: true) == ComposeMode.both.rawValue,
+              "testModeMigrateBadValueFallback")
+
+        // ---------- 整理归档：只处理选中的文件 ----------
+        let org = NSTemporaryDirectory() + "tl_onlyfiles"
+        try? fm3.removeItem(atPath: org)
+        try? fm3.createDirectory(atPath: org, withIntermediateDirectories: true)
+        for n in ["EP01.mp4", "EP02.mp4", "EP03.mp4"] {
+            fm3.createFile(atPath: org + "/" + n, contents: Data("x".utf8))
+        }
+        let picked = [URL(fileURLWithPath: org + "/EP02.mp4")]
+        let planAll = buildPlan(folder: URL(fileURLWithPath: org), title: "剧名",
+                                organize: true, srtEPName: false, template: "{剧名} EP{序号}")
+        let planPicked = buildPlan(folder: URL(fileURLWithPath: org), title: "剧名",
+                                   organize: true, srtEPName: false, template: "{剧名} EP{序号}",
+                                   onlyFiles: picked)
+        check(planAll.items.count == 3, "testBuildPlanWholeFolder")
+        check(planPicked.items.count == 1, "testBuildPlanOnlyFilesCount")
+        check(planPicked.items.first?.source.lastPathComponent == "EP02.mp4", "testBuildPlanOnlyFilesSource")
+        check(planPicked.items.first?.target.lastPathComponent == "剧名 EP02.mp4", "testBuildPlanOnlyFilesTarget")
+        try? fm3.removeItem(atPath: org)
+
         print(failures == 0 ? "--- ALL PASS ---" : "--- \(failures) FAILED ---")
         exit(failures == 0 ? 0 : 1)
     }

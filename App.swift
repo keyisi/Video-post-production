@@ -526,6 +526,16 @@ struct NiceField: View {
     }
 }
 
+/// 文件夹导入落空时的轻提示（只扫第一层这件事得说清楚，否则用户以为坏了）
+func alertEmptyImport(_ kind: String) {
+    let a = NSAlert()
+    a.messageText = "这个文件夹里没有找到\(kind)"
+    a.informativeText = "只会检查该文件夹第一层，不进子文件夹。可以试试把子文件夹直接拖进来。"
+    a.alertStyle = .informational
+    a.addButton(withTitle: "好")
+    a.runModal()
+}
+
 // 拖放区 + 已选文件列表
 struct DropZone: View {
     let icon: String
@@ -536,6 +546,10 @@ struct DropZone: View {
     let onPick: () -> Void
     let onClear: () -> Void
     let onDrop: ([NSItemProvider]) -> Bool
+    /// 文件夹导入入口；nil = 这个区域不支持文件夹导入
+    var onPickFolder: (() -> Void)? = nil
+    var fileButtonLabel: String = "导入文件"
+    var folderButtonLabel: String = "导入文件夹"
 
     @State private var targeted = false
 
@@ -550,6 +564,14 @@ struct DropZone: View {
                     Text(title).font(.system(size: 12.5, weight: .medium))
                         .foregroundStyle(targeted ? Theme.accent : Color.primary.opacity(0.6))
                     Text(hint).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                    // 文件 / 文件夹双入口：拖拽之外也能明确按类型导入
+                    HStack(spacing: 8) {
+                        importButton(fileButtonLabel, icon: "doc.badge.plus", enabled: !running) { onPick() }
+                        if let f = onPickFolder {
+                            importButton(folderButtonLabel, icon: "folder.badge.plus", enabled: !running) { f() }
+                        }
+                    }
+                    .padding(.top, 3)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 26)
@@ -577,13 +599,25 @@ struct DropZone: View {
                             Button {
                                 onPick()
                             } label: {
-                                Image(systemName: "plus")
+                                Image(systemName: "doc.badge.plus")
                             }
                             .buttonStyle(.plain)
                             .padding(4)
                             .background(Color.primary.opacity(0.06))
                             .clipShape(Circle())
-                            .help("继续添加（重新选择会替换）")
+                            .help("继续添加文件（追加，不会清空已选）")
+                            if let f = onPickFolder {
+                                Button {
+                                    f()
+                                } label: {
+                                    Image(systemName: "folder.badge.plus")
+                                }
+                                .buttonStyle(.plain)
+                                .padding(4)
+                                .background(Color.primary.opacity(0.06))
+                                .clipShape(Circle())
+                                .help("从文件夹继续添加（只扫该文件夹第一层）")
+                            }
                             Button {
                                 onClear()
                             } label: {
@@ -638,6 +672,23 @@ struct DropZone: View {
         }
         let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
         return ["jpg", "jpeg", "png", "heic", "webp", "tiff", "bmp"].contains(ext) ? "photo.fill" : "film.fill"
+    }
+
+    private func importButton(_ title: String, icon: String, enabled: Bool,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 10, weight: .semibold))
+                Text(title).font(.system(size: 11, weight: .medium))
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Theme.card)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
     }
 }
 
@@ -1014,9 +1065,10 @@ struct ExtractView: View {
         VStack(alignment: .leading, spacing: 12) {
             // 1. 视频
             DropZone(icon: "film.stack", title: "拖入视频，或点击选择",
-                     hint: "支持多选 · 每隔 N 秒截一帧，跨视频连续编号",
+                     hint: "支持多选 / 文件夹 · 每隔 N 秒截一帧，跨视频连续编号",
                      files: videos, running: running,
-                     onPick: pickVideos, onClear: { videos = [] }, onDrop: handleDrop)
+                     onPick: pickVideos, onClear: { videos = [] }, onDrop: handleDrop,
+                     onPickFolder: pickVideoFolder)
 
             // 2. 命名设置
             Card {
@@ -1163,8 +1215,27 @@ struct ExtractView: View {
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .video, .avi]
+        panel.prompt = "导入视频"
         if panel.runModal() == .OK {
-            videos = panel.urls.map { $0.path }
+            videos = mergePaths(videos, panel.urls.map { $0.path })
+        }
+    }
+
+    /// 文件夹导入：只扫第一层
+    func pickVideoFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "导入文件夹"
+        panel.message = "把该文件夹里的视频加进列表（只看第一层，不进子文件夹）"
+        if panel.runModal() == .OK {
+            let found = expandImport(panel.urls, wanted: videoImportExts)
+            if found.isEmpty {
+                alertEmptyImport("视频")
+            } else {
+                videos = mergePaths(videos, found)
+            }
         }
     }
 
@@ -1195,10 +1266,11 @@ struct ExtractView: View {
 
     func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         let urls = collectURLs(providers)
+        let found = expandImport(urls, wanted: videoImportExts)   // 拖入文件夹也能展开
         DispatchQueue.main.async {
-            videos = urls.map { $0.path }
+            videos = mergePaths(videos, found)
         }
-        return !urls.isEmpty
+        return !found.isEmpty
     }
 
     func start() {
@@ -1247,7 +1319,11 @@ struct ComposeView: View {
     // 文件列表用新 key（旧 key 在 onAppear 迁移一次）
     @AppStorage("fxt_compVideos") private var videosRaw = ""
     @AppStorage("fxt_compCovers") private var coversRaw = ""
-    @AppStorage("fxt_compEndingOn") private var endingOn = true
+    /// 处理模式：仅封面 / 仅片尾 / 封面+片尾（替代原来的布尔开关「处理结尾」）
+    @AppStorage("fxt_compMode") private var modeRaw = ComposeMode.both.rawValue
+    /// 旧布尔开关：只读，用于一次性迁移到三模式
+    @AppStorage("fxt_compEndingOn") private var legacyEndingOn = true
+    @AppStorage("fxt_compModeMigrated") private var modeMigrated = false
     // 时间参数复用原有 key：语义没变，老用户升级后不用重设
     @AppStorage("fxt_endFadeOut") private var fadeOutText = "0.25"
     @AppStorage("fxt_endWhiteHold") private var whiteHoldText = "0"
@@ -1288,6 +1364,10 @@ struct ComposeView: View {
     @State private var canvasH: Int = 0
     @State private var coverPixelW: Int = 0
     @State private var coverPixelH: Int = 0
+
+    private var mode: ComposeMode { ComposeMode(rawValue: modeRaw) ?? .both }
+    /// 是否处理结尾（仅封面模式为 false）
+    private var endingOn: Bool { mode.withEnding }
 
     private var currentSpeed: EncodeSpeed { EncodeSpeed(rawValue: encSpeed) ?? .fast }
     private var currentSize: SizeMode { SizeMode(rawValue: sizeMode) ?? .match }
@@ -1371,29 +1451,47 @@ struct ComposeView: View {
             VStack(alignment: .leading, spacing: 12) {
                 // 1. 视频
                 DropZone(icon: "film.stack", title: "拖入视频，或点击选择",
-                         hint: "支持多选 · 封面按集数自动匹配对应视频",
+                         hint: "支持多选 / 文件夹 · 封面按集数自动匹配对应视频",
                          files: videos, running: running,
-                         onPick: pickVideos, onClear: { videosRaw = "" }, onDrop: handleDropVideos)
+                         onPick: pickVideos, onClear: { videosRaw = "" }, onDrop: handleDropVideos,
+                         onPickFolder: pickVideoFolder)
 
-                // 2. 封面
-                DropZone(icon: "photo.stack", title: "拖入封面图，或点击选择",
-                         hint: "支持多选 · 文件名需含集数，如 Stranger Things EP02_cover.jpg",
-                         files: covers, running: running,
-                         onPick: pickCovers, onClear: { coversRaw = "" }, onDrop: handleDropCovers)
+                // 2. 封面（支持单独导入：文件或整个封面文件夹）
+                if mode.withCover {
+                    DropZone(icon: "photo.stack", title: "拖入封面图，或点击选择",
+                             hint: "支持多选 / 文件夹 · 文件名需含集数，如 Stranger Things EP02_cover.jpg",
+                             files: covers, running: running,
+                             onPick: pickCovers, onClear: { coversRaw = "" }, onDrop: handleDropCovers,
+                             onPickFolder: pickCoverFolder)
 
-                if !videos.isEmpty && !covers.isEmpty {
+                    if !videos.isEmpty && !covers.isEmpty {
+                        HStack(spacing: 8) {
+                            Image(systemName: matchedCount == videos.count
+                                  ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(matchedCount == videos.count ? Theme.ok : Theme.warn)
+                            Text("\(matchedCount)/\(videos.count) 个视频已按集数配对封面")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(matchedCount == videos.count ? Theme.ok : Theme.warn)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(Theme.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08)))
+                    }
+                } else {
                     HStack(spacing: 8) {
-                        Image(systemName: matchedCount == videos.count
-                              ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                        Image(systemName: "flag.checkered").font(.system(size: 11))
+                            .foregroundStyle(Theme.accent)
+                        Text("仅片尾模式：不插封面" + (covers.isEmpty ? "" : "（\(covers.count) 张封面已保留，切回其他模式可直接用）"))
                             .font(.system(size: 11))
-                            .foregroundStyle(matchedCount == videos.count ? Theme.ok : Theme.warn)
-                        Text("\(matchedCount)/\(videos.count) 个视频已按集数配对封面")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(matchedCount == videos.count ? Theme.ok : Theme.warn)
+                            .foregroundStyle(.secondary)
                         Spacer()
                     }
                     .padding(.horizontal, 12)
-                    .padding(.vertical, 7)
+                    .padding(.vertical, 9)
                     .background(Theme.card)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                     .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.08)))
@@ -1483,13 +1581,17 @@ struct ComposeView: View {
                 // 4. 结尾开关 + 时间轴参数
                 Card {
                     HStack(spacing: 8) {
-                        Toggle("处理结尾", isOn: $endingOn)
-                            .toggleStyle(.switch)
-                            .font(.system(size: 12, weight: .semibold))
-                            .disabled(running)
-                        Text(endingOn
-                             ? "封面 + 结尾一次编码完成（少一遍转码）"
-                             : "只把封面插入视频开头，不动结尾")
+                        Text("处理").font(.system(size: 12, weight: .semibold))
+                        Picker("", selection: $modeRaw) {
+                            ForEach(ComposeMode.allCases) { m in
+                                Text(m.label).tag(m.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 250)
+                        .disabled(running)
+                        Text(mode.hint)
                             .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -1632,11 +1734,10 @@ struct ComposeView: View {
                             if running {
                                 ProgressView().controlSize(.small).tint(.white)
                             } else {
-                                Image(systemName: endingOn ? "sparkles" : "photo.badge.plus")
+                                Image(systemName: mode.icon)
                                     .font(.system(size: 11, weight: .bold))
                             }
-                            Text(running ? "正在处理…"
-                                 : (endingOn ? "封面 + 结尾一次编码" : "把封面插入视频开头"))
+                            Text(running ? "正在处理…" : mode.buttonText)
                                 .font(.system(size: 13, weight: .semibold))
                         }
                         .padding(.horizontal, 22).padding(.vertical, 9)
@@ -1684,6 +1785,7 @@ struct ComposeView: View {
             .padding(.bottom, 16)
         }
         .onAppear {
+            migrateComposeModeOnce()
             migrateLegacyFiles()
             if sfxPath.isEmpty { sfxPath = EndingEngine.defaultSFX }
             refreshProbe()
@@ -1693,6 +1795,14 @@ struct ComposeView: View {
     }
 
     // MARK: 迁移与探测
+
+    /// 旧的布尔开关「处理结尾」→ 三模式，只迁移一次（幂等，否则每次启动都会覆盖用户的选择）
+    private func migrateComposeModeOnce() {
+        guard !modeMigrated else { return }
+        modeRaw = migrateComposeMode(modeRaw, legacyEndingOn: legacyEndingOn,
+                                     alreadyMigrated: false)
+        modeMigrated = true
+    }
 
     /// 旧板块的文件列表搬过来一次。
     /// 两个旧板块各有一份封面列表，都得搬 —— 只用「结尾处理」的用户若只搬
@@ -1764,7 +1874,7 @@ struct ComposeView: View {
         if !custom.isEmpty { return custom }
         guard let first = videos.first else { return nil }
         return URL(fileURLWithPath: first).deletingLastPathComponent()
-            .appendingPathComponent(endingOn ? "加结尾" : "加封面").path
+            .appendingPathComponent(mode.outFolder).path
     }
 
     private func openOutput() {
@@ -1780,7 +1890,27 @@ struct ComposeView: View {
         panel.canChooseFiles = true; panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .video, .avi]
-        if panel.runModal() == .OK { videosRaw = panel.urls.map { $0.path }.joined(separator: "\n") }
+        panel.prompt = "导入视频"
+        if panel.runModal() == .OK {
+            videosRaw = mergePaths(videos, panel.urls.map { $0.path }).joined(separator: "\n")
+        }
+    }
+
+    /// 视频文件夹导入：只扫第一层
+    func pickVideoFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false; panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "导入文件夹"
+        panel.message = "把该文件夹里的视频加进列表（只看第一层，不进子文件夹）"
+        if panel.runModal() == .OK {
+            let found = expandImport(panel.urls, wanted: videoImportExts)
+            if found.isEmpty {
+                alertEmptyImport("视频")
+            } else {
+                videosRaw = mergePaths(videos, found).joined(separator: "\n")
+            }
+        }
     }
 
     func pickCovers() {
@@ -1788,7 +1918,27 @@ struct ComposeView: View {
         panel.canChooseFiles = true; panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.image]
-        if panel.runModal() == .OK { coversRaw = panel.urls.map { $0.path }.joined(separator: "\n") }
+        panel.prompt = "导入封面"
+        if panel.runModal() == .OK {
+            coversRaw = mergePaths(covers, panel.urls.map { $0.path }).joined(separator: "\n")
+        }
+    }
+
+    /// 封面文件夹导入：短剧封面通常按集数命名放一个夹子里，一次全收
+    func pickCoverFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false; panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "导入封面文件夹"
+        panel.message = "把该文件夹里的图片加进封面列表（只看第一层，文件名需含集数）"
+        if panel.runModal() == .OK {
+            let found = expandImport(panel.urls, wanted: imageExts)
+            if found.isEmpty {
+                alertEmptyImport("图片")
+            } else {
+                coversRaw = mergePaths(covers, found).joined(separator: "\n")
+            }
+        }
     }
 
     func pickSFX() {
@@ -1822,22 +1972,25 @@ struct ComposeView: View {
     func handleDropVideos(_ providers: [NSItemProvider]) -> Bool {
         if running { return false }
         let urls = collectURLs(providers)
-        DispatchQueue.main.async { videosRaw = urls.map { $0.path }.joined(separator: "\n") }
-        return !urls.isEmpty
+        let found = expandImport(urls, wanted: videoImportExts)   // 拖入文件夹也能展开
+        DispatchQueue.main.async { videosRaw = mergePaths(videos, found).joined(separator: "\n") }
+        return !found.isEmpty
     }
 
     func handleDropCovers(_ providers: [NSItemProvider]) -> Bool {
         if running { return false }
         let urls = collectURLs(providers)
-        DispatchQueue.main.async { coversRaw = urls.map { $0.path }.joined(separator: "\n") }
-        return !urls.isEmpty
+        let found = expandImport(urls, wanted: imageExts)
+        DispatchQueue.main.async { coversRaw = mergePaths(covers, found).joined(separator: "\n") }
+        return !found.isEmpty
     }
 
     // MARK: 执行
 
     func start() {
         let list = videos
-        let coverList = covers
+        // 仅片尾模式：封面列表保留但不参与处理
+        let coverList = mode.withCover ? covers : []
         let s = settings
         let withEnding = endingOn
         running = true
@@ -1847,7 +2000,7 @@ struct ComposeView: View {
         currentIdx = 0
         RunControl.shared.begin()
         let customDir = outDirCustom.trimmingCharacters(in: .whitespaces)
-        let folder = withEnding ? "加结尾" : "加封面"
+        let folder = mode.outFolder
         // 归档模式：成片写回原位置，不建「加结尾」夹（否则会留个空文件夹）
         let archiveMode = withEnding && s.archiveOriginal
         if archiveMode {
@@ -1863,10 +2016,7 @@ struct ComposeView: View {
             try? FileManager.default.createDirectory(atPath: customDir, withIntermediateDirectories: true)
         }
 
-        let modeText: String
-        if !withEnding { modeText = "只插封面" }
-        else if coverList.isEmpty { modeText = "结尾处理" }
-        else { modeText = "封面+结尾（一次编码）" }
+        let modeText = mode == .both && coverList.isEmpty ? "仅片尾（无封面）" : mode.label
         var head = "开始\(modeText) \(list.count) 个视频"
         if withEnding {
             head += "：渐白 \(s.fadeOut)秒 / 全白保持 \(s.whiteHold)秒 / 渐显 \(s.fadeIn)秒 / 定格 \(s.freeze)秒"
@@ -2017,9 +2167,10 @@ struct StripView: View {
             VStack(alignment: .leading, spacing: 12) {
                 // 1. 视频
                 DropZone(icon: "film.stack", title: "拖入已加好片头片尾的成片",
-                         hint: "支持多选 · 自动定位片尾白场，切掉片头与片尾还原正片",
+                         hint: "支持多选 / 文件夹 · 自动定位片尾白场，切掉片头与片尾还原正片",
                          files: videos, running: running,
-                         onPick: pickVideos, onClear: { videos = [] }, onDrop: handleDrop)
+                         onPick: pickVideos, onClear: { videos = [] }, onDrop: handleDrop,
+                         onPickFolder: pickVideoFolder)
 
                 // 2. 切点
                 Card {
@@ -2332,7 +2483,22 @@ struct StripView: View {
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .video, .avi]
-        if panel.runModal() == .OK { videos = panel.urls.map { $0.path } }
+        panel.prompt = "导入视频"
+        if panel.runModal() == .OK { videos = mergePaths(videos, panel.urls.map { $0.path }) }
+    }
+
+    /// 文件夹导入：只扫第一层
+    func pickVideoFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "导入文件夹"
+        panel.message = "把该文件夹里的视频加进列表（只看第一层，不进子文件夹）"
+        if panel.runModal() == .OK {
+            let found = expandImport(panel.urls, wanted: videoImportExts)
+            if found.isEmpty { alertEmptyImport("视频") } else { videos = mergePaths(videos, found) }
+        }
     }
 
     func pickOutDir() {
@@ -2355,8 +2521,9 @@ struct StripView: View {
             }
         }
         group.wait()
-        DispatchQueue.main.async { videos = urls.map { $0.path } }
-        return !urls.isEmpty
+        let found = expandImport(urls, wanted: videoImportExts)   // 拖入文件夹也能展开
+        DispatchQueue.main.async { videos = mergePaths(videos, found) }
+        return !found.isEmpty
     }
 
     func openOutput() {
@@ -2371,6 +2538,8 @@ struct StripView: View {
 // MARK: - 板块 3: 整理归档（短剧整理助手：命名模板 + 分类夹归档 + 撤销 + CSV）
 struct OrganizerView: View {
     @State private var folderURL: URL?
+    /// 「导入文件」模式：只整理这几个文件（nil = 整理整个文件夹）
+    @State private var pickedFiles: [URL]?
     @State private var title: String = ""
     // 整理为分类夹：默认开启（原开关已按需求移除）
     private let organize = true
@@ -2405,13 +2574,14 @@ struct OrganizerView: View {
         VStack(alignment: .leading, spacing: 12) {
             // 1. 素材文件夹
             DropZone(icon: "folder.badge.gearshape",
-                     title: "拖入素材文件夹，或点击选择",
-                     hint: "文件夹内的视频/字幕将按模板整理，可分类归档",
-                     files: folderURL == nil ? [] : [folderURL!.path],
+                     title: "拖入素材文件夹 / 文件，或点击选择",
+                     hint: "文件夹内的视频/字幕按模板整理；也可以只导入几个文件",
+                     files: sourceList,
                      running: busy,
-                     onPick: { showPicker = true },
+                     onPick: pickFiles,
                      onClear: clearFolder,
-                     onDrop: handleFolderDrop)
+                     onDrop: handleFolderDrop,
+                     onPickFolder: { showPicker = true })
 
             // 2. 命名参数
             Card {
@@ -2659,17 +2829,50 @@ struct OrganizerView: View {
         return urls
     }
 
+    /// 拖入：文件夹优先当根目录，纯文件则走「只整理这些文件」
     func handleFolderDrop(_ providers: [NSItemProvider]) -> Bool {
         if busy { return false }
         let urls = collectURLs(providers)
-        guard let u = urls.first, u.hasDirectoryPath else { return false }
-        DispatchQueue.main.async { selectFolder(u) }
+        guard !urls.isEmpty else { return false }
+        let dirs = urls.filter { isDirectory($0) }
+        let files = urls.filter { !isDirectory($0) }
+        DispatchQueue.main.async {
+            if let d = dirs.first {
+                selectFolder(d)
+            } else if !files.isEmpty {
+                selectFiles(files)
+            }
+        }
         return true
+    }
+
+    /// 「导入文件」：只整理这几个文件
+    func pickFiles() {
+        if busy { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "导入文件"
+        panel.message = "选择要整理的视频 / 字幕文件（可多选）"
+        if panel.runModal() == .OK { selectFiles(panel.urls) }
     }
 
     func clearFolder() {
         folderURL = nil
+        pickedFiles = nil
         plan = []; notes = []; errors = []; logs = []; executed = false; emptyFolders = []
+    }
+
+    private var sourceList: [String] {
+        if let fs = pickedFiles, !fs.isEmpty { return fs.map { $0.path } }
+        return folderURL == nil ? [] : [folderURL!.path]
+    }
+
+    private func isDirectory(_ u: URL) -> Bool {
+        var d: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: u.path, isDirectory: &d)
+        return exists && d.boolValue
     }
 
     private func kindColor(_ k: ItemKind) -> Color {
@@ -2697,6 +2900,17 @@ struct OrganizerView: View {
 
     private func selectFolder(_ url: URL) {
         folderURL = url
+        pickedFiles = nil
+        plan = []; notes = []; errors = []; logs = []; executed = false; emptyFolders = []
+        scheduleScan()
+    }
+
+    /// 只整理选中的这几个文件：归档根取第一个文件所在文件夹
+    private func selectFiles(_ files: [URL]) {
+        let urls = files.filter { !isDirectory($0) }
+        guard let first = urls.first else { return }
+        pickedFiles = urls
+        folderURL = first.deletingLastPathComponent()
         plan = []; notes = []; errors = []; logs = []; executed = false; emptyFolders = []
         scheduleScan()
     }
@@ -2719,12 +2933,21 @@ struct OrganizerView: View {
         let tpl = template
         let cats = currentCats
         let out = currentOutput
+        let only = pickedFiles
+        // 跨文件夹选文件时给一句提示，免得归档位置出乎意料
+        let dirTip: String? = {
+            guard let fs = only, !fs.isEmpty else { return nil }
+            let parents = Set(fs.map { $0.deletingLastPathComponent().path })
+            return parents.count > 1
+                ? "所选文件来自 \(parents.count) 个文件夹，归档按第一个文件所在的文件夹"
+                : nil
+        }()
         DispatchQueue.global(qos: .userInitiated).async {
             let r = buildPlan(folder: folder, title: t, organize: org, srtEPName: false,
-                              template: tpl, cats: cats, outputFolder: out)
+                              template: tpl, cats: cats, outputFolder: out, onlyFiles: only)
             DispatchQueue.main.async {
                 plan = r.items
-                notes = r.notes
+                notes = (dirTip.map { [$0] } ?? []) + r.notes
                 errors = r.errors
                 busy = false
             }
@@ -2740,6 +2963,7 @@ struct OrganizerView: View {
         let tpl = template
         let cats = currentCats
         let out = currentOutput
+        let only = pickedFiles
         DispatchQueue.global(qos: .userInitiated).async {
             let result = executePlan(snapshot, overwrite: false)
             recordBatch(folder: folder, title: t, moves: result.moves)
@@ -2752,7 +2976,7 @@ struct OrganizerView: View {
                 canUndo = !result.moves.isEmpty
                 // 重新扫描一次，反映最新状态
                 let r = buildPlan(folder: folder, title: t, organize: org, srtEPName: false,
-                                  template: tpl, cats: cats, outputFolder: out)
+                                  template: tpl, cats: cats, outputFolder: out, onlyFiles: only)
                 plan = r.items
                 notes = r.notes
                 errors = r.errors

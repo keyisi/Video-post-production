@@ -1784,6 +1784,118 @@ func remapSection(_ old: Int) -> Int {
     }
 }
 
+// ---------- 文件导入：文件 / 文件夹统一展开 ----------
+
+/// 视频扩展名（导入用，比 `videoExts` 宽：扫描文件夹时得覆盖常见容器）
+let videoImportExts: Set<String> = ["mp4", "mov", "m4v", "mkv", "avi", "ts", "mts", "m2ts",
+                                    "flv", "wmv", "webm", "mpg", "mpeg", "3gp", "mxf", "dv"]
+/// 图片扩展名（封面用）
+let imageExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif", "webp", "tiff", "tif", "bmp", "gif"]
+/// 字幕扩展名（整理归档用）
+let subtitleExts: Set<String> = ["srt", "ass", "ssa", "vtt"]
+
+/// 把用户选中的 URL（文件与文件夹混合）展开成文件路径列表。
+/// - 文件：扩展名命中 `wanted` 才收（`wanted` 为空集 = 全收）
+/// - 文件夹：**只扫一层**，子文件夹不递归（用户确认过：导出目录通常平铺，递归会混入无关文件）
+/// - 结果去重，并按文件夹内的字典序稳定排列
+func expandImport(_ urls: [URL], wanted: Set<String>) -> [String] {
+    let fm = FileManager.default
+    var out: [String] = []
+    var seen = Set<String>()
+    func add(_ path: String) {
+        let p = (path as NSString).standardizingPath
+        guard !seen.contains(p) else { return }
+        seen.insert(p)
+        out.append(p)
+    }
+    func wanted_(_ ext: String) -> Bool { wanted.isEmpty || wanted.contains(ext.lowercased()) }
+
+    for u in urls {
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: u.path, isDirectory: &isDir) else { continue }
+        if isDir.boolValue {
+            let children = (try? fm.contentsOfDirectory(
+                at: u, includingPropertiesForKeys: [.isDirectoryKey], options: [])) ?? []
+            let sorted = children.sorted {
+                $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+            }
+            for c in sorted {
+                let name = c.lastPathComponent
+                if name.hasPrefix(".") { continue }
+                var childIsDir: ObjCBool = false
+                fm.fileExists(atPath: c.path, isDirectory: &childIsDir)
+                if childIsDir.boolValue { continue }   // 只扫一层
+                if wanted_(c.pathExtension) { add(c.path) }
+            }
+        } else if wanted_(u.pathExtension) {
+            add(u.path)
+        }
+    }
+    return out
+}
+
+/// 追加合并并去重：导入是「继续添加」，不是「替换」（清空有单独的垃圾桶按钮）
+func mergePaths(_ existing: [String], _ added: [String]) -> [String] {
+    var seen = Set(existing)
+    var out = existing
+    for p in added where !seen.contains(p) {
+        seen.insert(p)
+        out.append(p)
+    }
+    return out
+}
+
+/// 「封面与结尾」板块的处理模式。
+///
+/// 以前只有一个布尔开关「处理结尾」——想「只加片尾」得靠「留空封面列表」间接实现，
+/// 语义含糊。现在明确成三选一。
+enum ComposeMode: String, CaseIterable, Identifiable {
+    case coverOnly   = "仅封面"
+    case endingOnly  = "仅片尾"
+    case both        = "封面+片尾"
+
+    var id: String { rawValue }
+    var label: String { rawValue }
+
+    var hint: String {
+        switch self {
+        case .coverOnly:  return "只把封面插入视频开头，不动结尾（封面按集数匹配）"
+        case .endingOnly: return "只加片尾（渐白 / 定格 / 音效），完全不插封面"
+        case .both:       return "封面 + 片尾一次编码完成（少一遍转码）"
+        }
+    }
+    /// 是否处理结尾（仅封面模式不处理）
+    var withEnding: Bool { self != .coverOnly }
+    /// 是否使用封面（仅片尾模式忽略封面列表）
+    var withCover: Bool { self != .endingOnly }
+    /// 默认输出文件夹名
+    var outFolder: String { self == .coverOnly ? "加封面" : "加结尾" }
+
+    var icon: String {
+        switch self {
+        case .coverOnly:  return "photo.badge.plus"
+        case .endingOnly: return "flag.checkered"
+        case .both:       return "sparkles"
+        }
+    }
+    var buttonText: String {
+        switch self {
+        case .coverOnly:  return "插入封面"
+        case .endingOnly: return "只加片尾"
+        case .both:       return "封面 + 结尾"
+        }
+    }
+}
+
+/// 旧布尔开关 → 新模式的一次性迁移。
+/// `alreadyMigrated == true` 时一律原样返回（非法值兜底为 both），保证幂等。
+func migrateComposeMode(_ raw: String, legacyEndingOn: Bool, alreadyMigrated: Bool) -> String {
+    if alreadyMigrated {
+        return ComposeMode(rawValue: raw)?.rawValue ?? ComposeMode.both.rawValue
+    }
+    return legacyEndingOn ? ComposeMode.both.rawValue : ComposeMode.coverOnly.rawValue
+}
+
 /// 新导航的板块总数（用于越界钳制）
 let sectionCount = 5
 
@@ -2506,9 +2618,11 @@ struct CategoryNames {
 
 let defaultCats = CategoryNames(sub: "字幕", clean: "纯净", main: "成片")
 
+/// - Parameter onlyFiles: 非空时只处理这些文件（「导入文件」模式），不再枚举整个目录。
+///   文件所在目录仍作为归档根，用于确定输出位置与分类夹。
 func buildPlan(folder origFolder: URL, title: String, organize: Bool, srtEPName: Bool,
                pad: Int = 0, template: String = "", cats: CategoryNames = defaultCats,
-               outputFolder: URL? = nil) -> PlanResult {
+               outputFolder: URL? = nil, onlyFiles: [URL]? = nil) -> PlanResult {
     let fm = FileManager.default
     let folder = origFolder.resolvingSymlinksInPath()
     var items: [PlanItem] = []
@@ -2556,12 +2670,41 @@ func buildPlan(folder origFolder: URL, title: String, organize: Bool, srtEPName:
         items.append(PlanItem(source: source, target: target, kind: kind, size: size(of: source)))
     }
 
+    let catSet = Set(cats.all)
+
+    // 「导入文件」模式：只处理用户选中的那几个文件，不扫整个目录
+    if let only = onlyFiles, !only.isEmpty {
+        for f in only.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let fname = f.lastPathComponent
+            if fname.hasPrefix(".") { continue }
+            guard let p = parseEpisodeFile(fname) else {
+                notes.append("跳过文件（无法识别集数）：\(fname)")
+                continue
+            }
+            let base = (fname as NSString).deletingPathExtension
+            let parentName = f.deletingLastPathComponent().lastPathComponent
+            if catSet.contains(parentName) {
+                // 已经在分类夹里：原地改名（换剧名 / 换模板）
+                let ext = isVideoExt(p.ext) || p.ext == "srt" ? p.ext : (fname as NSString).pathExtension
+                append(f, f.deletingLastPathComponent()
+                        .appendingPathComponent(nameFor(digits: p.digits, ext: ext, original: base)), .rename)
+            } else if isVideoExt(p.ext) {
+                append(f, dest.appendingPathComponent("\(cats.main)/\(nameFor(digits: p.digits, ext: p.ext, original: base))"), .main)
+            } else if p.ext == "srt" {
+                let targetName = srtEPName ? nameFor(digits: p.digits, ext: "srt", original: base) : fname
+                append(f, dest.appendingPathComponent("\(cats.sub)/\(targetName)"), .sub)
+            } else {
+                notes.append("跳过文件（未知类型）：\(fname)")
+            }
+        }
+        return PlanResult(items: items, notes: notes, errors: [])
+    }
+
     guard let children = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey], options: []) else {
         return PlanResult(items: [], notes: [], errors: ["无法读取目录：\(folder.path)"])
     }
 
     var subfolderCount = 0
-    let catSet = Set(cats.all)
 
     for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
         let name = child.lastPathComponent
