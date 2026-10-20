@@ -1149,6 +1149,9 @@ struct JobSettings {
     var speed: EncodeSpeed = .fast   // 编码速度档位
     var sizeMode: SizeMode = .match  // 输出体积档位（默认跟随原片）
     var coverZoom: Double = 1.0      // 封面缩放（1=完整显示补黑边；>1 放大裁切；<1 缩小留边）
+    /// 原片移入「原片」文件夹，成片用原文件名写回原位置（此时 suffix / outputDir 都不再生效）
+    var archiveOriginal: Bool = false
+    var archiveFolder: String = "原片"
 }
 
 // 耗时格式化: 8.4 秒 / 1 分 23 秒 / 1 小时 02 分
@@ -1211,8 +1214,62 @@ enum EndingEngine {
                         sfxStart: max(0, foStart + s.sfxOffset))
     }
 
+    // MARK: 原片归档（原片移入「原片」夹，成片占回原位）
+
+    static func archiveFolderName(_ s: JobSettings) -> String {
+        let n = s.archiveFolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        return n.isEmpty ? "原片" : n
+    }
+
+    /// 归档目录 = 视频同目录下的「原片」
+    static func archiveDir(for input: String, settings s: JobSettings) -> URL {
+        URL(fileURLWithPath: input).deletingLastPathComponent()
+            .appendingPathComponent(archiveFolderName(s), isDirectory: true)
+    }
+
+    /// 归档目标路径；同名已存在时依次加 -1、-2…，绝不覆盖已归档的原片
+    static func archiveURL(for input: String, settings s: JobSettings) -> URL {
+        let src = URL(fileURLWithPath: input)
+        let dir = archiveDir(for: input, settings: s)
+        let base = src.deletingPathExtension().lastPathComponent
+        let ext = src.pathExtension
+        var cand = dir.appendingPathComponent(src.lastPathComponent)
+        var i = 1
+        while FileManager.default.fileExists(atPath: cand.path) && i < 1000 {
+            cand = dir.appendingPathComponent(ext.isEmpty ? "\(base)-\(i)" : "\(base)-\(i).\(ext)")
+            i += 1
+        }
+        return cand
+    }
+
+    /// 真正把原片挪进归档夹，返回新路径（失败返回 nil，原文件保持不动）
+    static func archiveSource(_ input: String, settings s: JobSettings) -> String? {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: input) else { return nil }
+        let dst = archiveURL(for: input, settings: s)
+        do {
+            try fm.createDirectory(at: dst.deletingLastPathComponent(),
+                                   withIntermediateDirectories: true)
+            try fm.moveItem(atPath: input, toPath: dst.path)
+            return dst.path
+        } catch {
+            return nil
+        }
+    }
+
+    /// 回滚：把归档的原片搬回原位（成片半成品由调用方先删，避免撞名）
+    static func restoreSource(archived: String, to original: String) {
+        let fm = FileManager.default
+        guard archived != original,
+              fm.fileExists(atPath: archived),
+              !fm.fileExists(atPath: original) else { return }
+        try? fm.moveItem(atPath: archived, toPath: original)
+    }
+
     static func outputURL(for input: String, settings s: JobSettings) -> URL {
         let src = URL(fileURLWithPath: input)
+        // 归档模式：成片直接占用原片位置（原片已先被移进「原片」夹，这里不会撞名）
+        if s.archiveOriginal { return src }
         let dir: URL
         if let od = s.outputDir, !od.isEmpty {
             dir = URL(fileURLWithPath: od, isDirectory: true)
@@ -1267,19 +1324,28 @@ enum EndingEngine {
         let fc = buildFilter(dur, settings: s,
                              audio: hasAudio(input), useSFX: useSFX)
         let out = outputURL(for: input, settings: s)
-        guard out.path != input else { return nil }  // 防止顶掉源文件
+        // 归档模式下输出就是原路径（原片先被 mv 走），不算冲突
+        guard s.archiveOriginal || out.path != input else { return nil }  // 防止顶掉源文件
+        // 归档后 ffmpeg 读的是搬进「原片」夹的那份
+        let srcPath = s.archiveOriginal ? archiveURL(for: input, settings: s).path : input
         try? FileManager.default.createDirectory(
             at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
         var parts = [shellQuoted(ffmpegBin()),
                      "-hide_banner", "-loglevel", "error", "-y",
-                     "-i", shellQuoted(input)]
+                     "-i", shellQuoted(srcPath)]
         if useSFX { parts += ["-i", shellQuoted(sfx)] }
         parts += ["-filter_complex", shellQuoted(fc),
                   "-map", "[v]", "-map", "[a]"]
         parts += s.speed.videoArgs(targetBitRate: targetVideoKbps(input, sizeMode: s.sizeMode))
         parts += ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
                   "-y", shellQuoted(out.path)]
-        return parts.joined(separator: " ")
+        var cmd = parts.joined(separator: " ")
+        if s.archiveOriginal {
+            cmd = "/bin/mkdir -p " + shellQuoted(archiveDir(for: input, settings: s).path) +
+                  " && /bin/mv " + shellQuoted(input) + " " + shellQuoted(srcPath) +
+                  " && " + cmd
+        }
+        return cmd
     }
 
     @discardableResult
@@ -1299,23 +1365,38 @@ enum EndingEngine {
         r.total = t.total
         let out = outputURL(for: input, settings: s)
         r.output = out.path
-        if out.path == input {
+        if !s.archiveOriginal && out.path == input {
             r.message = "输出与源文件同名同目录，请勾选「加后缀命名」或设置输出目录"; return r
         }
-        if !s.overwrite && FileManager.default.fileExists(atPath: out.path) {
+        // 归档模式下 out 就是源文件本身（马上就让它让位），不存在「已存在」这一说
+        if !s.archiveOriginal && !s.overwrite && FileManager.default.fileExists(atPath: out.path) {
             r.message = "输出已存在，跳过"; return r
         }
         let sfx = s.sfxPath ?? ""
         let useSFX = !sfx.isEmpty && FileManager.default.fileExists(atPath: sfx)
+        // 归档模式：先把原片挪进「原片」夹，再把成片写回原路径
+        var srcPath = input
+        if s.archiveOriginal {
+            guard let moved = archiveSource(input, settings: s) else {
+                r.message = "原片移入「\(archiveFolderName(s))」失败，已中止（未改动任何文件）"
+                return r
+            }
+            srcPath = moved
+        }
+        /// 把「原片已挪走」这件事还原：删半成品 + 原片搬回原位
+        func rollback() {
+            try? FileManager.default.removeItem(at: out)
+            restoreSource(archived: srcPath, to: input)
+        }
         let fc = buildFilter(dur, settings: s,
-                             audio: hasAudio(input), useSFX: useSFX)
+                             audio: hasAudio(srcPath), useSFX: useSFX)
         try? FileManager.default.createDirectory(
             at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-        var args = ["-hide_banner", "-loglevel", "error", "-y", "-i", input]
+        var args = ["-hide_banner", "-loglevel", "error", "-y", "-i", srcPath]
         if useSFX { args += ["-i", sfx] }
         args += ["-filter_complex", fc, "-map", "[v]", "-map", "[a]"]
-        args += s.speed.videoArgs(targetBitRate: targetVideoKbps(input, sizeMode: s.sizeMode))
+        args += s.speed.videoArgs(targetBitRate: targetVideoKbps(srcPath, sizeMode: s.sizeMode))
         args += ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out.path]
 
         let t0 = Date()
@@ -1327,12 +1408,16 @@ enum EndingEngine {
             onProgress?(1.0)
             r.success = true
             r.message = String(format: "完成（总长 %.2fs，用时 %@）", t.total, humanDuration(r.elapsed))
+            if s.archiveOriginal {
+                r.message += "，成片已替换原位置，原片在「\(archiveFolderName(s))」夹"
+            }
         } else if RunControl.shared.isCancelled {
             r.cancelled = true
             r.message = "已停止（未完成，已清理半成品）"
-            try? FileManager.default.removeItem(at: out)
+            rollback()
         } else {
             r.message = "失败：" + String(res.err.suffix(300))
+            rollback()
         }
         return r
     }
@@ -1381,10 +1466,11 @@ enum EndingEngine {
         return fc
     }
 
-    static func combinedArgs(input: String, cover: String, fc: String,
+    /// fps 由调用方传入：归档模式下 input 指向「原片」夹里那份，--print-cmd 时它还没被 mv 过去，
+    /// 所以这里不能再自己对 input 做 probe
+    static func combinedArgs(input: String, cover: String, fc: String, fps: Double,
                              settings s: JobSettings, out: URL) -> [String]? {
-        guard let (_, _, fps, _) = probeVideoInfo(input),
-              probeDuration(input) != nil else { return nil }
+        guard fps > 0, isVideo(input) else { return nil }
         let still = 1.0 / fps
         let sfx = s.sfxPath ?? ""
         let useSFX = !sfx.isEmpty && FileManager.default.fileExists(atPath: sfx)
@@ -1406,10 +1492,11 @@ enum EndingEngine {
         let fc = buildCombinedFilter(dur, w: w, h: h, fps: fps, coverPath: cover,
                                      settings: s, audio: hasAudio(input), useSFX: useSFX)
         let out = outputURL(for: input, settings: s)
-        guard out.path != input else { return nil }  // 防止顶掉源文件
+        guard s.archiveOriginal || out.path != input else { return nil }  // 防止顶掉源文件
+        let srcPath = s.archiveOriginal ? archiveURL(for: input, settings: s).path : input
         try? FileManager.default.createDirectory(
             at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard let rawArgs = combinedArgs(input: input, cover: cover, fc: fc,
+        guard let rawArgs = combinedArgs(input: srcPath, cover: cover, fc: fc, fps: fps,
                                          settings: s, out: out),
               rawArgs.count > 4 else { return nil }
         // 重新 shell-quote 导出（combinedArgs 里是裸参数，供 Process 用）
@@ -1421,7 +1508,13 @@ enum EndingEngine {
             quoted.append(isFlag ? a : shellQuoted(a))
         }
         // combinedArgs 不含二进制路径（runTool 会补），导出 shell 命令需补在开头
-        return shellQuoted(ffmpegBin()) + " " + quoted.joined(separator: " ")
+        var cmd = shellQuoted(ffmpegBin()) + " " + quoted.joined(separator: " ")
+        if s.archiveOriginal {
+            cmd = "/bin/mkdir -p " + shellQuoted(archiveDir(for: input, settings: s).path) +
+                  " && /bin/mv " + shellQuoted(input) + " " + shellQuoted(srcPath) +
+                  " && " + cmd
+        }
+        return cmd
     }
 
     @discardableResult
@@ -1447,21 +1540,39 @@ enum EndingEngine {
         r.total = t.total + 1.0 / fps
         let out = outputURL(for: input, settings: s)
         r.output = out.path
-        if out.path == input {
+        if !s.archiveOriginal && out.path == input {
             r.message = "输出与源文件同名同目录，请勾选「加后缀命名」或设置输出目录"; return r
         }
-        if !s.overwrite && FileManager.default.fileExists(atPath: out.path) {
+        // 归档模式下 out 就是源文件本身（马上就让它让位），不存在「已存在」这一说
+        if !s.archiveOriginal && !s.overwrite && FileManager.default.fileExists(atPath: out.path) {
             r.message = "输出已存在，跳过"; return r
         }
         let sfx = s.sfxPath ?? ""
         let useSFX = !sfx.isEmpty && FileManager.default.fileExists(atPath: sfx)
+        // 音轨有无先探测（原片挪走前后内容一致，这里读原路径即可）
+        let hasA = hasAudio(input)
+        // 归档模式：先把原片挪进「原片」夹，再把成片写回原路径
+        var srcPath = input
+        if s.archiveOriginal {
+            guard let moved = archiveSource(input, settings: s) else {
+                r.message = "原片移入「\(archiveFolderName(s))」失败，已中止（未改动任何文件）"
+                return r
+            }
+            srcPath = moved
+        }
+        /// 把「原片已挪走」这件事还原：删半成品 + 原片搬回原位
+        func rollback() {
+            try? FileManager.default.removeItem(at: out)
+            restoreSource(archived: srcPath, to: input)
+        }
         let fc = buildCombinedFilter(dur, w: w, h: h, fps: fps, coverPath: cover,
-                                     settings: s, audio: hasAudio(input), useSFX: useSFX)
+                                     settings: s, audio: hasA, useSFX: useSFX)
         try? FileManager.default.createDirectory(
             at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard let args = combinedArgs(input: input, cover: cover, fc: fc,
+        guard let args = combinedArgs(input: srcPath, cover: cover, fc: fc, fps: fps,
                                       settings: s, out: out),
               args.count > 4 else {
+            rollback()
             r.message = "构建命令失败"; return r
         }
         let t0 = Date()
@@ -1473,12 +1584,16 @@ enum EndingEngine {
             onProgress?(1.0)
             r.success = true
             r.message = String(format: "完成（封面+结尾，总长 %.2fs，用时 %@）", r.total, humanDuration(r.elapsed))
+            if s.archiveOriginal {
+                r.message += "，成片已替换原位置，原片在「\(archiveFolderName(s))」夹"
+            }
         } else if RunControl.shared.isCancelled {
             r.cancelled = true
             r.message = "已停止（未完成，已清理半成品）"
-            try? FileManager.default.removeItem(at: out)
+            rollback()
         } else {
             r.message = "失败：" + String(res.err.suffix(300))
+            rollback()
         }
         return r
     }
@@ -1763,6 +1878,7 @@ func cliMain() {
     }
     // 结尾处理模式: --ending <视频或目录...> [--sfx 路径] [--fade-out 秒] [--hold 秒] [--fade-in 秒]
     //              [--freeze 秒] [--sfx-offset 秒] [--afade 秒] [--speed fast|standard] [--size match|high] [--suffix 后缀] [--cover-zoom 1.0] [-o 目录] [--overwrite] [--print-cmd]
+    //              [--archive] 原片移入「原片」夹，成片用原文件名写回原位置（此时 --suffix / -o 失效）
     if args.first == "--ending" {
         var paths: [String] = []
         var s = JobSettings()
@@ -1795,6 +1911,9 @@ func cliMain() {
             case "--print-cmd": printCmd = true
             case "--cover": coverArg = need()
             case "--cover-zoom": s.coverZoom = Double(need()) ?? s.coverZoom
+            // 原片移入「原片」夹，成片原地替换
+            case "--archive": s.archiveOriginal = true
+            case "--archive-folder": s.archiveFolder = need(); s.archiveOriginal = true
             default: paths.append(a)
             }
             i += 1
@@ -1851,7 +1970,8 @@ func cliMain() {
             exit(failed == 0 ? 0 : 1)
         }
         var failed = 0
-        print("共 \(inputs.count) 个视频，音效：\(s.sfxPath ?? "无")\(covers.isEmpty ? "" : "，封面：\(coverArg ?? "")")")
+        print("共 \(inputs.count) 个视频，音效：\(s.sfxPath ?? "无")\(covers.isEmpty ? "" : "，封面：\(coverArg ?? "")")"
+              + (s.archiveOriginal ? "，原片移入「\(EndingEngine.archiveFolderName(s))」夹、成片原地替换" : ""))
         for input in inputs {
             print("▶ \((input as NSString).lastPathComponent)")
             let r: EndingResult

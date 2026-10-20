@@ -1247,6 +1247,8 @@ struct ComposeView: View {
     @AppStorage("fxt_endRename") private var rename = true
     @AppStorage("fxt_endOverwrite") private var overwrite = false
     @AppStorage("fxt_endOutDir") private var outDirCustom = ""
+    /// 原片移入「原片」文件夹，成片用原文件名写回原位置
+    @AppStorage("fxt_endArchive") private var archiveOriginal = false
     @AppStorage("fxt_endAFade") private var audioFadeOn = false
     @AppStorage("fxt_endAFadeDur") private var audioFadeDurText = "0.5"
     @AppStorage("fxt_endSpeed") private var encSpeed = EncodeSpeed.fast.rawValue
@@ -1340,6 +1342,13 @@ struct ComposeView: View {
         s.speed = currentSpeed
         s.sizeMode = currentSize
         s.coverZoom = min(max(coverZoom, 0.5), 3.0)
+        // 只插封面那条路径不参与归档，所以这个开关只在「处理结尾」开启时生效
+        let archiveOn = endingOn && archiveOriginal
+        s.archiveOriginal = archiveOn
+        if archiveOn {
+            s.suffix = ""     // 成片沿用原文件名
+            s.outputDir = nil // 输出位置就是原位置
+        }
         return s
     }
 
@@ -1525,9 +1534,11 @@ struct ComposeView: View {
                 Card {
                     FieldLabel("folder", "输出")
                     HStack(spacing: 8) {
-                        NiceField(endingOn ? "默认: 每个视频旁的「加结尾」文件夹"
-                                          : "默认: 每个视频旁的「加封面」文件夹",
-                                  text: $outDirCustom, disabled: running)
+                        NiceField(endingOn
+                                  ? (archiveOriginal ? "原片移入「原片」夹，成片原地替换"
+                                                     : "默认: 每个视频旁的「加结尾」文件夹")
+                                  : "默认: 每个视频旁的「加封面」文件夹",
+                                  text: $outDirCustom, disabled: running || archiveOriginal)
                         Button { pickOutDir() } label: {
                             Image(systemName: "folder.badge.plus").font(.system(size: 11))
                         }
@@ -1544,6 +1555,21 @@ struct ComposeView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 7))
                         .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1)))
                         .disabled(running || videos.isEmpty)
+                    }
+                    if endingOn {
+                        Divider().opacity(0.35)
+                        HStack(spacing: 8) {
+                            Toggle("原片移入「原片」文件夹，成片原地替换", isOn: $archiveOriginal)
+                                .toggleStyle(.checkbox)
+                                .font(.system(size: 11, weight: .medium))
+                                .disabled(running)
+                            Spacer()
+                        }
+                        Text(archiveOriginal
+                             ? "原片 → 视频旁的「原片」夹；成片用原文件名写回原位置（后缀与输出目录都不生效）"
+                             : "勾选后不再另存到「加结尾」夹：原片让位，成片接手原名")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
                     }
                     // 输出体积两条路径都用（只插封面走 insertCoverToVideo 也读它），
                     // 所以不能跟着结尾开关一起隐藏
@@ -1574,8 +1600,9 @@ struct ComposeView: View {
                         }
                         HStack(spacing: 8) {
                             Toggle("文件名加后缀", isOn: $rename).toggleStyle(.checkbox)
-                                .font(.system(size: 11)).disabled(running)
-                            NiceField("定格白场", text: $suffix, width: 120, disabled: running || !rename)
+                                .font(.system(size: 11)).disabled(running || archiveOriginal)
+                            NiceField("定格白场", text: $suffix, width: 120,
+                                      disabled: running || !rename || archiveOriginal)
                             Toggle("覆盖已存在", isOn: $overwrite).toggleStyle(.checkbox)
                                 .font(.system(size: 11)).disabled(running)
                             Spacer()
@@ -1716,6 +1743,11 @@ struct ComposeView: View {
     // MARK: 输出目录
 
     private var effectiveOutDir: String? {
+        // 归档模式成片写回原位置，打开就看视频所在目录
+        if endingOn && archiveOriginal {
+            guard let first = videos.first else { return nil }
+            return URL(fileURLWithPath: first).deletingLastPathComponent().path
+        }
         let custom = outDirCustom.trimmingCharacters(in: .whitespaces)
         if !custom.isEmpty { return custom }
         guard let first = videos.first else { return nil }
@@ -1804,7 +1836,11 @@ struct ComposeView: View {
         RunControl.shared.begin()
         let customDir = outDirCustom.trimmingCharacters(in: .whitespaces)
         let folder = withEnding ? "加结尾" : "加封面"
-        if customDir.isEmpty {
+        // 归档模式：成片写回原位置，不建「加结尾」夹（否则会留个空文件夹）
+        let archiveMode = withEnding && s.archiveOriginal
+        if archiveMode {
+            // 什么都不建：原片夹由 EndingEngine 逐个视频按需创建
+        } else if customDir.isEmpty {
             for d in Set(list.map {
                 URL(fileURLWithPath: $0).deletingLastPathComponent()
                     .appendingPathComponent(folder).path }) {
@@ -1831,7 +1867,9 @@ struct ComposeView: View {
         if abs(s.coverZoom - 1.0) > 0.001 {
             head += "，封面缩放 \(Int((s.coverZoom * 100).rounded()))%"
         }
-        head += customDir.isEmpty ? "，输出到每个视频旁的「\(folder)」文件夹" : "，输出到 \(customDir)"
+        head += archiveMode
+            ? "，原片移入「原片」夹、成片原地替换"
+            : (customDir.isEmpty ? "，输出到每个视频旁的「\(folder)」文件夹" : "，输出到 \(customDir)")
         logs = [head]
 
         let size = currentSize
@@ -1875,7 +1913,7 @@ struct ComposeView: View {
 
                 // 路径 B：结尾（有封面就一次编码）
                 var sv = s
-                sv.outputDir = outDir
+                sv.outputDir = archiveMode ? nil : outDir
                 let prog: (Double) -> Void = { frac in
                     let base = Double(vi) / Double(list.count)
                     let span = 1.0 / Double(list.count)

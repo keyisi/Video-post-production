@@ -227,6 +227,88 @@ struct TimelineModelTests {
         check(f3.contains("force_original_aspect_ratio=decrease") && f3.contains("pad="),
               "testCoverFilterFallback")
 
+        // 17. 原片归档：成片占回原路径、归档目标在同目录「原片」下、同名自动去重
+        let fm2 = FileManager.default
+        let tmp2 = NSTemporaryDirectory() + "tl_archive"
+        try? fm2.removeItem(atPath: tmp2)
+        try? fm2.createDirectory(atPath: tmp2, withIntermediateDirectories: true)
+        let vPath = tmp2 + "/EP01.mp4"
+        fm2.createFile(atPath: vPath, contents: Data("x".utf8))
+        var asettings = JobSettings()
+        asettings.archiveOriginal = true
+        asettings.suffix = "定格白场"
+        asettings.outputDir = tmp2 + "/somewhere"
+        let plain = JobSettings()
+        check(EndingEngine.outputURL(for: vPath, settings: plain).path == tmp2 + "/EP01定格白场.mp4",
+              "testNormalOutputKeepsSuffix")
+        check(EndingEngine.outputURL(for: vPath, settings: asettings).path == vPath,
+              "testArchiveOutputIsOriginalPath")
+        check(EndingEngine.archiveURL(for: vPath, settings: asettings).path == tmp2 + "/原片/EP01.mp4",
+              "testArchiveURL")
+        if let moved = EndingEngine.archiveSource(vPath, settings: asettings) {
+            check(moved == tmp2 + "/原片/EP01.mp4", "testArchiveSourceMove")
+            check(!fm2.fileExists(atPath: vPath), "testArchiveSourceRemovesOriginal")
+            // 原片让位后，成片就能写回原路径
+            check(EndingEngine.outputURL(for: vPath, settings: asettings).path == vPath,
+                  "testArchiveTargetFreeAfterMove")
+            // 失败回滚：先删半成品再把原片搬回来，内容必须还是原来那份
+            EndingEngine.restoreSource(archived: moved, to: vPath)
+            check(((try? String(contentsOfFile: vPath, encoding: .utf8)) ?? "") == "x",
+                  "testRestoreSourceBack")
+            // 原位已被占时不得乱搬（调用方要先清掉半成品）
+            fm2.createFile(atPath: vPath, contents: Data("out".utf8))
+            EndingEngine.restoreSource(archived: moved, to: vPath)
+            check(((try? String(contentsOfFile: vPath, encoding: .utf8)) ?? "") == "out",
+                  "testRestoreSourceKeepsExisting")
+        } else {
+            check(false, "testArchiveSourceMove")
+        }
+        // 同名已存在：加 -1，绝不覆盖已归档的原片
+        let p2 = tmp2 + "/EP02.mp4"
+        fm2.createFile(atPath: p2, contents: Data("new".utf8))
+        try? fm2.createDirectory(atPath: tmp2 + "/原片", withIntermediateDirectories: true)
+        fm2.createFile(atPath: tmp2 + "/原片/EP02.mp4", contents: Data("old".utf8))
+        check(EndingEngine.archiveURL(for: p2, settings: asettings).path == tmp2 + "/原片/EP02-1.mp4",
+              "testArchiveURLDedup")
+        var customFolder = asettings
+        customFolder.archiveFolder = "备份"
+        check(EndingEngine.archiveURL(for: p2, settings: customFolder).path == tmp2 + "/备份/EP02.mp4",
+              "testArchiveFolderCustom")
+        var blankFolder = asettings
+        blankFolder.archiveFolder = "   "
+        let p4 = tmp2 + "/EP04.mp4"
+        check(EndingEngine.archiveURL(for: p4, settings: blankFolder).path == tmp2 + "/原片/EP04.mp4",
+              "testArchiveFolderFallback")
+        try? fm2.removeItem(atPath: tmp2)
+
+        // 18. 端到端：归档模式下原片进「原片」夹、成片用原名占回原位
+        let tmp3 = NSTemporaryDirectory() + "tl_archive_e2e"
+        try? fm2.removeItem(atPath: tmp3)
+        try? fm2.createDirectory(atPath: tmp3, withIntermediateDirectories: true)
+        let vin = tmp3 + "/EP03.mp4"
+        _ = runTool(ffmpegBin(), ["-y", "-v", "error", "-f", "lavfi",
+                                  "-i", "testsrc=size=320x240:rate=24", "-t", "1",
+                                  "-pix_fmt", "yuv420p", vin])
+        if fm2.fileExists(atPath: vin), let d0 = probeDuration(vin) {
+            var es = JobSettings()
+            es.archiveOriginal = true
+            es.fadeOut = 0.2; es.whiteHold = 0; es.fadeIn = 0.2; es.freeze = 0.5
+            let r3 = EndingEngine.run(input: vin, settings: es)
+            let archivedPath = tmp3 + "/原片/EP03.mp4"
+            check(r3.success, "testArchiveE2ESuccess")
+            check(r3.output == vin, "testArchiveE2EOutputPath")
+            check(fm2.fileExists(atPath: vin) && fm2.fileExists(atPath: archivedPath),
+                  "testArchiveE2EFilesBothExist")
+            if let dNew = probeDuration(vin), let dOld = probeDuration(archivedPath) {
+                check(dNew > dOld + 0.4 && abs(dOld - d0) < 0.15, "testArchiveE2EDurations")
+            } else {
+                check(false, "testArchiveE2EDurations")
+            }
+        } else {
+            print("  (跳过: 归档端到端造片失败)")
+        }
+        try? fm2.removeItem(atPath: tmp3)
+
         print(failures == 0 ? "--- ALL PASS ---" : "--- \(failures) FAILED ---")
         exit(failures == 0 ? 0 : 1)
     }
