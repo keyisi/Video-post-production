@@ -48,6 +48,8 @@
 
 ### 3. 反推（去片头片尾）
 
+![反推](screenshots/05_反推.png)
+
 - 把**已经加好片头片尾的成片**反向处理：切掉片头的封面帧和片尾的白场/定格段，还原出正片
 - **自动定位片尾**：扫描逐帧亮度（signalstats，3 分钟 1080p 约零点几秒），找到片尾白场的起点——不需要记得当初的参数；「探测第一个」自动回填片尾时长，也可以留空让每个视频各自探测
 - **两种切点**：
@@ -145,7 +147,7 @@ vtool -show-build "build/Video Post-Production.app/Contents/MacOS/VideoFrameTool
 ├── main.swift       # CLI 顶层入口（仅此文件允许顶层代码）
 ├── build.sh         # 一键构建，固定 -target 并用 vtool 复核 minos
 ├── tests/           # TimelineModelTests.swift（120 条断言，含封面缩放/归档/反推/导入/模式迁移）
-├── screenshots/     # 界面截图（抽帧、封面与结尾、整理归档、关于与更新）
+├── screenshots/     # 界面截图（抽帧、封面与结尾、反推、整理归档、关于与更新）
 ├── 调试记录.md       # 每次排查/修复的归档（现象→根因→修复→验证）
 └── build/           # 现成的 App（内置 ffmpeg / ffprobe）
 ```
