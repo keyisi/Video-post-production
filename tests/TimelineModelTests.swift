@@ -179,8 +179,18 @@ struct TimelineModelTests {
         }
         check(migrateSection(2, alreadyMigrated: true) == 2, "testSectionMigrated2StaysOrganizer")
         check(migrateSection(3, alreadyMigrated: true) == 3, "testSectionMigrated3StaysAbout")
-        check(migrateSection(99, alreadyMigrated: true) == 3, "testSectionMigratedClampHigh")
+        check(migrateSection(99, alreadyMigrated: true) == sectionCount - 1,
+              "testSectionMigratedClampHigh")
         check(migrateSection(-5, alreadyMigrated: true) == 0, "testSectionMigratedClampLow")
+
+        // 14b. 4 项 → 5 项（新增「反推」插在第 3 位）：旧 2/3 后移，0/1 不动。
+        //      同样非幂等，调用方必须用一次性开关护住，测试要覆盖映射值本身。
+        check(insertStripSection(0) == 0, "testInsertStrip0")
+        check(insertStripSection(1) == 1, "testInsertStrip1")
+        check(insertStripSection(2) == 3, "testInsertStrip2To3")
+        check(insertStripSection(3) == 4, "testInsertStrip3To4")
+        check(insertStripSection(-1) == 0, "testInsertStripNegative")
+        check(insertStripSection(99) == sectionCount - 1, "testInsertStripClampHigh")
 
         // 15. NaN / inf 不得穿透 clamp 直达 ffmpeg 滤镜串
         var nm = TimelineModel()
@@ -308,6 +318,85 @@ struct TimelineModelTests {
             print("  (跳过: 归档端到端造片失败)")
         }
         try? fm2.removeItem(atPath: tmp3)
+
+        // 19. 反推：纯函数 analyzeEnding（正片 → 渐白 → 全白 → 渐显 → 定格）
+        func lumaRun(_ startT: Double, _ count: Int, _ value: Double,
+                     _ fps: Double = 25) -> [LumaSample] {
+            (0..<count).map { LumaSample(t: startT + Double($0) / fps, yavg: value) }
+        }
+        var series: [LumaSample] = lumaRun(0, 100, 120)          // 正片 0~4.0s
+        for i in 0..<15 {                                        // 渐白 4.0~4.6s
+            series.append(LumaSample(t: 4.0 + Double(i) / 25,
+                                     yavg: 120 + 115 * Double(i + 1) / 15))
+        }
+        series += lumaRun(4.6, 12, 235)                          // 全白保持 4.6~5.08s
+        for i in 0..<12 {                                        // 渐显 5.08~5.56s
+            series.append(LumaSample(t: 5.08 + Double(i) / 25,
+                                     yavg: 235 - 115 * Double(i + 1) / 12))
+        }
+        series += lumaRun(5.56, 30, 120)                         // 定格
+        if let a = analyzeEnding(series) {
+            check(abs(a.whiteStart - 4.6) < 0.05, "testAnalyzeWhiteStart")
+            check(abs(a.fadeStart - 4.0) < 0.08, "testAnalyzeFadeStart")
+        } else {
+            check(false, "testAnalyzeWhiteStart"); check(false, "testAnalyzeFadeStart")
+        }
+        // 没有白场 / 序列过短 / 画面本来就接近全白：都不能硬切，必须返回 nil
+        check(analyzeEnding(lumaRun(0, 200, 120)) == nil, "testAnalyzeNoWhiteTail")
+        check(analyzeEnding(lumaRun(0, 5, 120)) == nil, "testAnalyzeTooShort")
+        check(analyzeEnding(lumaRun(0, 200, 233)) == nil, "testAnalyzeAllWhite")
+        // 白场出现在正片中间（闪白镜头）：取最后一段近白区，不能把正片切掉
+        var mid = lumaRun(0, 50, 120)
+        mid += lumaRun(2.0, 5, 235)
+        mid += lumaRun(2.2, 50, 120)
+        if let am = analyzeEnding(mid) {
+            check(abs(am.whiteStart - 2.0) < 0.05, "testAnalyzeMidWhite")
+        } else { check(false, "testAnalyzeMidWhite") }
+
+        // 20. 端到端：先加封面+结尾，再反推，长度必须回到原片
+        let tmp4 = NSTemporaryDirectory() + "tl_strip"
+        try? fm2.removeItem(atPath: tmp4)
+        try? fm2.createDirectory(atPath: tmp4, withIntermediateDirectories: true)
+        let raw = tmp4 + "/raw.mp4"
+        let cov = tmp4 + "/cover.png"
+        _ = runTool(ffmpegBin(), ["-y", "-v", "error", "-f", "lavfi",
+                                  "-i", "testsrc=size=320x240:rate=25", "-t", "3",
+                                  "-pix_fmt", "yuv420p", raw])
+        _ = runTool(ffmpegBin(), ["-y", "-v", "error", "-f", "lavfi",
+                                  "-i", "color=c=red:s=240x320", "-frames:v", "1", cov])
+        if let d0 = probeDuration(raw), fm2.fileExists(atPath: cov) {
+            var m = TimelineModel()
+            m.sourceDuration = d0
+            m.fadeOut = 0.3; m.whiteHold = 0.4; m.fadeIn = 0.3; m.freeze = 0.8
+            var es = m.toJobSettings()
+            es.outputDir = tmp4; es.suffix = "_end"; es.sfxPath = nil
+            let rr = EndingEngine.runCombined(input: raw, cover: cov, settings: es)
+            if rr.success, let made = rr.output, let d1 = probeDuration(made),
+               let det = detectEnding(in: made) {
+                check(d1 > d0 + 1.0, "testStripE2ECombinedLonger")
+                var st = StripSettings()
+                st.outputDir = tmp4
+                st.head = (probeVideoInfo(made)?.2).flatMap { $0 > 0 ? 1.0 / $0 : nil } ?? 0
+                // 保留渐白过渡 → 长度回到原片
+                st.suffix = "_back"; st.tail = det.tailAtWhite
+                let sr = StripEngine.run(input: made, settings: st)
+                check(sr.success, "testStripE2ESuccess")
+                if let back = sr.output, let d2 = probeDuration(back) {
+                    check(abs(d2 - d0) < 0.12, "testStripE2EKeepFadeLength")
+                } else { check(false, "testStripE2EKeepFadeLength") }
+                // 连渐白一起切 → 比原片短一个 fadeOut（0.3s）
+                st.suffix = "_clean"; st.tail = det.tailAtFade
+                let sr2 = StripEngine.run(input: made, settings: st)
+                if sr2.success, let back2 = sr2.output, let d3 = probeDuration(back2) {
+                    check(abs(d3 - (d0 - 0.3)) < 0.15, "testStripE2EDropFadeLength")
+                } else { check(false, "testStripE2EDropFadeLength") }
+            } else {
+                print("  (跳过: 反推端到端前置条件失败)")
+            }
+        } else {
+            print("  (跳过: 反推端到端造片失败)")
+        }
+        try? fm2.removeItem(atPath: tmp4)
 
         print(failures == 0 ? "--- ALL PASS ---" : "--- \(failures) FAILED ---")
         exit(failures == 0 ? 0 : 1)

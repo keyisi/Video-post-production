@@ -1785,7 +1785,7 @@ func remapSection(_ old: Int) -> Int {
 }
 
 /// 新导航的板块总数（用于越界钳制）
-let sectionCount = 4
+let sectionCount = 5
 
 /// 一次性板块迁移：只在 `alreadyMigrated == false` 时做 5→4 的错位映射，
 /// 之后一律不再映射（仅把越界值钳回合法范围）。
@@ -1798,6 +1798,211 @@ func migrateSection(_ stored: Int, alreadyMigrated: Bool) -> Int {
         return min(max(stored, 0), sectionCount - 1)
     }
     return remapSection(stored)
+}
+
+// ---------- 反推：把已加好的片头（封面帧）与片尾切掉，还原正片 ----------
+
+/// 逐帧平均亮度采样点
+struct LumaSample {
+    let t: Double
+    let yavg: Double
+}
+
+/// 纯函数：从逐帧亮度序列反推片尾位置（抽出来是为了能直接单测）。
+///
+/// 正向流程的时间轴是：封面 → 正片（**最后 fadeOut 秒叠了渐白**）→ 全白保持 → 渐显 → 定格，
+/// 所以"正片结束"有两个候选切点：
+/// - `whiteStart`：白场起点 = 正片结束。长度与原片一致，但最后 fadeOut 秒的画面已被渐白覆盖，原始像素拿不回来了
+/// - `fadeStart`：渐白起点 = 画面完全没被破坏的边界，比 whiteStart 早一个 fadeOut
+///
+/// 返回 nil = 没检测到白场片尾（本来就没加结尾，或画面整体太亮/太暗分不出白场）。
+func analyzeEnding(_ series: [LumaSample]) -> (whiteStart: Double, fadeStart: Double)? {
+    guard series.count >= 8 else { return nil }
+    let sorted = series.map { $0.yavg }.sorted()
+    let base = sorted[sorted.count / 2]              // 中位数当"正常画面亮度"基线
+    guard let peak = series.map({ $0.yavg }).max() else { return nil }
+    // 连一个接近全白的帧都没有，就别硬猜
+    guard peak >= 200, peak - base > 25 else { return nil }
+    let thr = peak - 6                                // 近似全白
+    guard var k = series.lastIndex(where: { $0.yavg >= thr }) else { return nil }
+    // 1) 往前走完整个白场平台 → 正片结束（白场起点）
+    while k > 0, series[k - 1].yavg >= thr { k -= 1 }
+    let whiteStart = series[k].t
+    // 2) 继续往前找渐白起点：亮度回落到接近基线
+    let lo = base + 0.03 * (peak - base)
+    var m = k
+    while m > 0, series[m - 1].yavg >= lo { m -= 1 }
+    return (whiteStart, series[m].t)
+}
+
+/// 跑一遍 signalstats 取逐帧平均亮度（先缩到 64×36，解码才是主要开销）。
+/// 3 分钟 1080p 约 0.2~1 秒，比抽帧分析快一个量级。
+func probeLumaSeries(_ path: String) -> [LumaSample]? {
+    let fm = FileManager.default
+    let tmp = NSTemporaryDirectory() + "fxt_luma_\(UUID().uuidString).txt"
+    defer { try? fm.removeItem(atPath: tmp) }
+    // metadata 用 : 分隔参数，路径里的 : 必须转义
+    let escaped = tmp.replacingOccurrences(of: ":", with: "\\:")
+    _ = runTool(ffmpegBin(), ["-v", "error", "-i", path,
+                              "-vf", "scale=64:36,signalstats,metadata=print:file=\(escaped)",
+                              "-an", "-f", "null", "-"])
+    guard let text = try? String(contentsOfFile: tmp, encoding: .utf8) else { return nil }
+    var out: [LumaSample] = []
+    var t = 0.0
+    for raw in text.split(separator: "\n") {
+        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if line.hasPrefix("frame:") {
+            for part in line.split(separator: " ") where part.hasPrefix("pts_time:") {
+                if let v = Double(part.dropFirst("pts_time:".count)) { t = v }
+            }
+        } else if line.hasPrefix("lavfi.signalstats.YAVG="),
+                  let v = Double(line.dropFirst("lavfi.signalstats.YAVG=".count)) {
+            out.append(LumaSample(t: t, yavg: v))
+        }
+    }
+    return out.isEmpty ? nil : out
+}
+
+struct DetectedEnding {
+    var total: Double = 0
+    var whiteStart: Double = 0   // 正片结束（保留渐白过渡）
+    var fadeStart: Double = 0    // 渐白起点（画面未受损的边界）
+    var tailAtWhite: Double { max(total - whiteStart, 0) }
+    var tailAtFade: Double { max(total - fadeStart, 0) }
+}
+
+/// 探测一个成片的片尾在哪（失败返回 nil）
+func detectEnding(in path: String) -> DetectedEnding? {
+    guard let series = probeLumaSeries(path),
+          let a = analyzeEnding(series),
+          let total = probeDuration(path) else { return nil }
+    var d = DetectedEnding()
+    d.total = total
+    d.whiteStart = min(max(a.whiteStart, 0), total)
+    d.fadeStart = min(max(a.fadeStart, 0), total)
+    return d
+}
+
+/// 片尾切点：保留渐白过渡（正片完整长度）／连渐白一起切（画面完全干净）
+enum TailCut: String, CaseIterable {
+    case keepFade, dropFade
+    var label: String { self == .keepFade ? "保留渐白过渡" : "连渐白一起切" }
+    var hint: String {
+        self == .keepFade
+        ? "切在白场起点：长度与原片一致，但最后几秒是渐白画面（原始像素已被覆盖，拿不回来）"
+        : "切在渐白之前：画面完全干净，但比原片短一个渐白时长"
+    }
+}
+
+struct StripSettings {
+    var head: Double = 0            // 片头时长（App 加封面固定插 1 帧）
+    var tail: Double = 0            // 片尾时长（从末尾往前切掉多少）
+    var suffix: String = "_正片"
+    var outputDir: String? = nil
+    var overwrite: Bool = false
+    var speed: EncodeSpeed = .fast
+    var sizeMode: SizeMode = .match
+}
+
+struct StripResult {
+    var input: String = ""
+    var output: String? = nil
+    var message: String = ""
+    var success = false
+    var elapsed: Double = 0
+}
+
+enum StripEngine {
+
+    static func outputURL(for input: String, settings s: StripSettings) -> URL {
+        let src = URL(fileURLWithPath: input)
+        let dir: URL
+        if let od = s.outputDir, !od.isEmpty {
+            dir = URL(fileURLWithPath: od, isDirectory: true)
+        } else {
+            dir = src.deletingLastPathComponent()
+        }
+        return dir.appendingPathComponent(
+            src.deletingPathExtension().lastPathComponent + s.suffix + ".mp4")
+    }
+
+    /// 切掉片头 head 秒、片尾 tail 秒，重新编码（切点不在关键帧上，无法 -c copy）
+    @discardableResult
+    static func run(input: String, settings s: StripSettings,
+                    onProgress: ((Double) -> Void)? = nil) -> StripResult {
+        var r = StripResult(input: input)
+        guard EndingEngine.isVideo(input) else { r.message = "不支持的格式"; return r }
+        guard let dur = probeDuration(input), dur > 0.2 else {
+            r.message = "读取视频时长失败"; return r
+        }
+        let head = min(max(s.head.isFinite ? s.head : 0, 0), dur - 0.2)
+        let tail = min(max(s.tail.isFinite ? s.tail : 0, 0), dur - 0.2)
+        let keep = dur - head - tail
+        guard keep > 0.1 else { r.message = "片头 + 片尾已经超过视频总长"; return r }
+        let out = outputURL(for: input, settings: s)
+        r.output = out.path
+        guard out.path != input else {
+            r.message = "输出与源文件同名，请改后缀或指定输出目录"; return r
+        }
+        if !s.overwrite && FileManager.default.fileExists(atPath: out.path) {
+            r.message = "输出已存在，跳过"; return r
+        }
+        try? FileManager.default.createDirectory(
+            at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        // -ss 放在 -i 前面：先 seek 再解码，比输出侧 seek 快得多，切点同样精确
+        var args = ["-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", String(format: "%.4f", head), "-i", input,
+                    "-t", String(format: "%.4f", keep)]
+        args += s.speed.videoArgs(targetBitRate: targetVideoKbps(input, sizeMode: s.sizeMode))
+        args += EndingEngine.hasAudio(input)
+            ? ["-c:a", "aac", "-b:a", "128k"] : ["-an"]
+        args += ["-movflags", "+faststart", out.path]
+
+        let t0 = Date()
+        let res = onProgress.map {
+            runToolProgress(ffmpegBin(), withProgressArgs(args), totalSeconds: keep, onProgress: $0)
+        } ?? runTool(ffmpegBin(), args)
+        r.elapsed = Date().timeIntervalSince(t0)
+        if res.code == 0 {
+            onProgress?(1.0)
+            r.success = true
+            r.message = String(format: "完成（%.2fs → %.2fs，用时 %@）", dur, keep, humanDuration(r.elapsed))
+        } else if RunControl.shared.isCancelled {
+            r.message = "已停止（未完成的半成品已清理）"
+            try? FileManager.default.removeItem(at: out)
+        } else {
+            r.message = "失败：" + String(res.err.suffix(300))
+        }
+        return r
+    }
+
+    /// 导出 shell 命令（--print-cmd 调试用）
+    static func command(input: String, settings s: StripSettings) -> String? {
+        guard EndingEngine.isVideo(input), let dur = probeDuration(input), dur > 0.2 else { return nil }
+        let head = min(max(s.head.isFinite ? s.head : 0, 0), dur - 0.2)
+        let tail = min(max(s.tail.isFinite ? s.tail : 0, 0), dur - 0.2)
+        let keep = dur - head - tail
+        guard keep > 0.1 else { return nil }
+        let out = outputURL(for: input, settings: s)
+        guard out.path != input else { return nil }
+        var parts = [EndingEngine.shellQuoted(ffmpegBin()),
+                     "-hide_banner", "-loglevel", "error", "-y",
+                     "-ss", String(format: "%.4f", head),
+                     "-i", EndingEngine.shellQuoted(input),
+                     "-t", String(format: "%.4f", keep)]
+        parts += s.speed.videoArgs(targetBitRate: targetVideoKbps(input, sizeMode: s.sizeMode))
+        parts += EndingEngine.hasAudio(input) ? ["-c:a", "aac", "-b:a", "128k"] : ["-an"]
+        parts += ["-movflags", "+faststart", EndingEngine.shellQuoted(out.path)]
+        return parts.joined(separator: " ")
+    }
+}
+
+// 板块从 4 个加到 5 个（「反推」插在第 3 位）：旧 2（整理归档）→3、旧 3（关于与更新）→4。
+/// ⚠️ 同样**不是幂等的**，只能跑一次，调用方必须用一次性开关护住（否则板块会逐次往下漂移）。
+func insertStripSection(_ old: Int) -> Int {
+    guard old >= 2 else { return max(old, 0) }
+    return min(old + 1, sectionCount - 1)
 }
 
 // ---------- CLI 测试入口 ----------
@@ -1824,6 +2029,76 @@ func cliMain() {
                                    coverZoom: zoom) { print($0) }
         print(r ? "OK: \(dir)" : "FAILED")
         exit(r ? 0 : 1)
+    }
+    // 反推模式: --strip <视频或目录...> [--head 秒] [--tail 秒] [--detect] [--drop-fade] [-o 目录] [--suffix 后缀] [--overwrite] [--print-cmd]
+    if args.first == "--strip" {
+        var paths: [String] = []
+        var s = StripSettings()
+        var detect = false
+        var dropFade = false
+        var printCmd = false
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            func need() -> String {
+                i += 1
+                guard i < args.count else { print("参数 \(a) 缺少值"); exit(2) }
+                return args[i]
+            }
+            switch a {
+            case "--head": s.head = Double(need()) ?? 0
+            case "--tail": s.tail = Double(need()) ?? 0
+            case "--detect": detect = true
+            case "--drop-fade": dropFade = true
+            case "-o": s.outputDir = need()
+            case "--suffix": s.suffix = need()
+            case "--overwrite": s.overwrite = true
+            case "--speed": s.speed = EncodeSpeed(rawValue: need().lowercased()) ?? .fast
+            case "--size": s.sizeMode = SizeMode(rawValue: need().lowercased()) ?? .match
+            case "--print-cmd": printCmd = true
+            default: paths.append(a)
+            }
+            i += 1
+        }
+        let inputs = EndingEngine.collectInputs(from: paths.map { URL(fileURLWithPath: $0) })
+        guard !inputs.isEmpty else { print("没有找到可处理的视频（支持 mp4/mov/m4v）"); exit(1) }
+        var failed = 0
+        for input in inputs {
+            var ss = s
+            let name = (input as NSString).lastPathComponent
+            if detect {
+                guard let d = detectEnding(in: input) else {
+                    print("▶ \(name)")
+                    print("  ✗ 没检测到白场片尾（可能本来就沒加结尾，或画面太亮/太暗），请手动指定 --tail")
+                    failed += 1
+                    continue
+                }
+                ss.tail = dropFade ? d.tailAtFade : d.tailAtWhite
+                if ss.head <= 0, let fps = probeVideoInfo(input)?.2, fps > 0 { ss.head = 1.0 / fps }
+                print("▶ \(name)  总长 \(String(format: "%.2f", d.total))s"
+                      + " · 正片结束 \(String(format: "%.2f", d.whiteStart))s（片尾 \(String(format: "%.2f", d.tailAtWhite))s）"
+                      + " · 渐白起点 \(String(format: "%.2f", d.fadeStart))s（片尾 \(String(format: "%.2f", d.tailAtFade))s）")
+            } else {
+                print("▶ \(name)")
+            }
+            if printCmd {
+                if let cmd = StripEngine.command(input: input, settings: ss) {
+                    print(cmd)
+                } else {
+                    FileHandle.standardError.write("✗ 无法构建命令：\(input)\n".data(using: .utf8)!)
+                    failed += 1
+                }
+                continue
+            }
+            let r = StripEngine.run(input: input, settings: ss)
+            if r.success {
+                print("  ✓ \(r.message) → \(r.output ?? "")")
+            } else {
+                print("  ✗ \(r.message)")
+                failed += 1
+            }
+        }
+        exit(failed == 0 ? 0 : 1)
     }
     // 统一模式: --uni <起始名> <后缀> <间隔秒> <视频...> [-o 目录] [--jpg]
     if args.first == "--uni" {
@@ -1996,7 +2271,7 @@ func cliMain() {
         if let r = incrementEpisode(args[1]) { print(r); exit(0) }
         print("NO_MATCH"); exit(2)
     }
-    print("用法: VideoPostCLI --uni <起始名> <后缀> <间隔秒> <视频...> | --insert <视频> <封面> [-o 目录] | --cover <输出名> <视频> | --ending <视频...> [结尾参数] | --ep <名称>")
+    print("用法: VideoPostCLI --uni <起始名> <后缀> <间隔秒> <视频...> | --insert <视频> <封面> [-o 目录] | --cover <输出名> <视频> | --ending <视频...> [结尾参数] | --strip <视频...> [--detect] | --ep <名称>")
     exit(1)
 }
 // 短剧整理助手 —— 逻辑层 v3

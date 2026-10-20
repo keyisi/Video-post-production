@@ -282,6 +282,8 @@ struct ContentView: View {
     @AppStorage("fxt_section") private var section = 0
     /// 板块由 5 个减为 4 个的错位迁移只做一次（v3.18.0）
     @AppStorage("fxt_sectionRemapped") private var sectionRemapped = false
+    /// 板块由 4 个增到 5 个（「反推」插在第 3 位）的错位迁移只做一次（v3.21.0）
+    @AppStorage("fxt_sectionStripInserted") private var sectionStripInserted = false
     @StateObject private var updates = UpdateCenter()
 
     var body: some View {
@@ -293,8 +295,9 @@ struct ContentView: View {
             ZStack {
                 sectionLayer(0) { ExtractView() }
                 sectionLayer(1) { ComposeView() }
-                sectionLayer(2) { OrganizerView() }
-                sectionLayer(3) { AboutView() }
+                sectionLayer(2) { StripView() }
+                sectionLayer(3) { OrganizerView() }
+                sectionLayer(4) { AboutView() }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.top, 2)
@@ -307,8 +310,16 @@ struct ContentView: View {
         // 必须只跑一次 —— remapSection 不是幂等的（2→1、3→2），每次启动都跑会把
         // 用户当前所在板块逐次往下挪一格，最后永远停在「封面与结尾」。
         .onAppear {
+            // ① 5→4 的旧迁移（v3.18.0，老用户才需要）
             section = migrateSection(section, alreadyMigrated: sectionRemapped)
             sectionRemapped = true
+            // ② 4→5：新增「反推」插在第 3 位，旧 tag 2/3 后移一格。
+            //   同样只能跑一次，否则每次启动都会把用户所在板块往下挪。
+            if !sectionStripInserted {
+                section = insertStripSection(section)
+                sectionStripInserted = true
+            }
+            section = min(max(section, 0), sectionCount - 1)
         }
         .task { updates.startupCheck() }
         .onReceive(NotificationCenter.default.publisher(for: .fxtCheckUpdate)) { _ in
@@ -333,8 +344,9 @@ struct ContentView: View {
     private let navItems: [(title: String, icon: String, tag: Int)] = [
         ("视频抽帧", "photo.on.rectangle.angled", 0),
         ("封面与结尾", "flag.checkered", 1),
-        ("整理归档", "archivebox", 2),
-        ("关于与更新", "info.circle", 3),
+        ("反推（去片头片尾）", "scissors", 2),
+        ("整理归档", "archivebox", 3),
+        ("关于与更新", "info.circle", 4),
     ]
 
     private var sidebar: some View {
@@ -1969,6 +1981,390 @@ struct ComposeView: View {
         stopping = true
         logs.append("正在停止…（等待当前视频的编码进程退出，已完成的不受影响）")
         RunControl.shared.cancel()
+    }
+}
+
+// MARK: - 板块 2: 反推（把已加好的片头封面帧与片尾切掉，还原正片）
+struct StripView: View {
+    @AppStorage("fxt_stripHead") private var headText = ""
+    @AppStorage("fxt_stripTail") private var tailText = ""
+    @AppStorage("fxt_stripCut") private var cutRaw = TailCut.keepFade.rawValue
+    @AppStorage("fxt_stripSuffix") private var suffix = "_正片"
+    @AppStorage("fxt_stripOutDir") private var outputDir = ""
+    @AppStorage("fxt_stripSpeed") private var encSpeed = EncodeSpeed.fast.rawValue
+    @AppStorage("fxt_stripSize") private var sizeMode = SizeMode.match.rawValue
+
+    @State private var videos: [String] = []
+    @State private var running = false
+    @State private var stopping = false
+    @State private var progressValue: Double = 0
+    @State private var currentIdx = 0
+    @State private var logs: [String] = []
+    @State private var summary = ""
+    @State private var detecting = false
+    @State private var detectInfo = ""
+
+    private var cut: TailCut { TailCut(rawValue: cutRaw) ?? .keepFade }
+    private var speed: EncodeSpeed { EncodeSpeed(rawValue: encSpeed) ?? .fast }
+    private var size: SizeMode { SizeMode(rawValue: sizeMode) ?? .match }
+    /// 片尾时长留空 = 每个视频各自自动探测（同批参数一致时用固定值更快）
+    private var tailAuto: Bool { tailText.trimmingCharacters(in: .whitespaces).isEmpty }
+    /// 片头时长留空 = 自动按 1 帧算（App 加封面固定插 1 帧）
+    private var headAuto: Bool { headText.trimmingCharacters(in: .whitespaces).isEmpty }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                // 1. 视频
+                DropZone(icon: "film.stack", title: "拖入已加好片头片尾的成片",
+                         hint: "支持多选 · 自动定位片尾白场，切掉片头与片尾还原正片",
+                         files: videos, running: running,
+                         onPick: pickVideos, onClear: { videos = [] }, onDrop: handleDrop)
+
+                // 2. 切点
+                Card {
+                    FieldLabel("scissors", "切点")
+                    HStack(spacing: 14) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            FieldLabel("arrow.right.to.line", "片头时长（秒）")
+                            NiceField("留空 = 1 帧自动", text: $headText, width: 110, disabled: running)
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            FieldLabel("arrow.left.to.line", "片尾时长（秒）")
+                            NiceField("留空 = 自动探测", text: $tailText, width: 110, disabled: running)
+                        }
+                        VStack(alignment: .leading, spacing: 6) {
+                            FieldLabel("wand.and.stars", "自动探测")
+                            Button {
+                                autoDetect()
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if detecting { ProgressView().controlSize(.small).scaleEffect(0.6) }
+                                    Text(detecting ? "探测中…" : "探测第一个")
+                                        .font(.system(size: 11.5))
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(Theme.card)
+                            .clipShape(RoundedRectangle(cornerRadius: 7))
+                            .overlay(RoundedRectangle(cornerRadius: 7)
+                                .stroke(Color.primary.opacity(0.1)))
+                            .disabled(running || detecting || videos.isEmpty)
+                            .help("扫描第一个视频的逐帧亮度，定位片尾白场并回填「片尾时长」")
+                        }
+                        Spacer()
+                    }
+                    if !detectInfo.isEmpty {
+                        Text(detectInfo)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Divider().opacity(0.35)
+                    HStack(spacing: 10) {
+                        FieldLabel("chevron.left.forwardslash.chevron.right", "片尾切点")
+                        Picker("", selection: $cutRaw) {
+                            ForEach(TailCut.allCases, id: \.rawValue) { c in
+                                Text(c.label).tag(c.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented).labelsHidden().frame(width: 220)
+                        .disabled(running)
+                        .onChange(of: cutRaw) { _ in detectInfo = "" }
+                        Spacer()
+                    }
+                    Text(cut.hint)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                // 3. 输出
+                Card {
+                    FieldLabel("folder", "输出")
+                    HStack(spacing: 8) {
+                        NiceField("默认: 存在每个视频旁边", text: $outputDir, disabled: running)
+                        Button { pickOutDir() } label: {
+                            Image(systemName: "folder.badge.plus").font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain).padding(7).background(Theme.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1)))
+                        .disabled(running)
+                        Button { openOutput() } label: {
+                            Label("打开", systemImage: "folder").font(.system(size: 11.5))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(Theme.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1)))
+                        .disabled(running || videos.isEmpty)
+                    }
+                    HStack(spacing: 10) {
+                        FieldLabel("textformat", "文件名后缀")
+                        NiceField("_正片", text: $suffix, width: 110, disabled: running)
+                        Text("输出：<原文件名>\(suffix).mp4").font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
+                        Spacer()
+                    }
+                    HStack(spacing: 10) {
+                        FieldLabel("gauge", "编码速度")
+                        Picker("", selection: $encSpeed) {
+                            ForEach(EncodeSpeed.allCases, id: \.rawValue) { s in
+                                Text(s.label).tag(s.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented).labelsHidden().frame(width: 160)
+                        .disabled(running)
+                        Text(speed.hint).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                        Spacer()
+                    }
+                    HStack(spacing: 10) {
+                        FieldLabel("slider.horizontal.3", "输出体积")
+                        Picker("", selection: $sizeMode) {
+                            ForEach(SizeMode.allCases, id: \.rawValue) { m in
+                                Text(m.label).tag(m.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented).labelsHidden().frame(width: 160)
+                        .disabled(running)
+                        Text(size.hint).font(.system(size: 10.5)).foregroundStyle(.tertiary)
+                        Spacer()
+                    }
+                }
+
+                // 4. 日志
+                LogPanel(logs: logs).frame(minHeight: 120)
+
+                // 5. 动作
+                HStack(spacing: 12) {
+                    Button { start() } label: {
+                        HStack(spacing: 7) {
+                            if running {
+                                ProgressView().controlSize(.small).tint(.white)
+                            } else {
+                                Image(systemName: "scissors").font(.system(size: 11, weight: .bold))
+                            }
+                            Text(running ? "正在处理…" : "切掉片头片尾")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        .padding(.horizontal, 22).padding(.vertical, 9)
+                        .foregroundStyle(.white)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9)
+                                .fill(LinearGradient(colors: [Theme.accent, Theme.accentDeep],
+                                                     startPoint: .leading, endPoint: .trailing))
+                                .opacity(canStart ? 1 : 0.35))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canStart)
+
+                    if running {
+                        Button { stop() } label: {
+                            HStack(spacing: 7) {
+                                Image(systemName: "stop.fill").font(.system(size: 10.5, weight: .bold))
+                                Text(stopping ? "正在停止…" : "停止处理")
+                                    .font(.system(size: 13, weight: .semibold))
+                            }
+                            .padding(.horizontal, 18).padding(.vertical, 9)
+                            .foregroundStyle(.white)
+                            .background(RoundedRectangle(cornerRadius: 9)
+                                .fill(Theme.warn.opacity(stopping ? 0.45 : 0.95)))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(stopping)
+                    }
+
+                    if !summary.isEmpty {
+                        Text(summary)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(summary.hasPrefix("已停止") ? Theme.warn : Theme.ok)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                }
+
+                if running || progressValue > 0 {
+                    NiceProgress(value: progressValue,
+                                 label: running ? "\(min(currentIdx + 1, max(videos.count, 1)))/\(videos.count)" : nil)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 16)
+        }
+    }
+
+    var canStart: Bool { !running && !videos.isEmpty }
+
+    // MARK: 参数
+
+    /// head 用 -1 当哨兵：执行时再按每个视频的 fps 换成 1 帧时长
+    private var baseSettings: StripSettings {
+        var s = StripSettings()
+        s.head = headAuto ? -1 : (Double(headText) ?? 0)
+        s.tail = tailAuto ? 0 : (Double(tailText) ?? 0)
+        s.suffix = suffix
+        let od = outputDir.trimmingCharacters(in: .whitespaces)
+        s.outputDir = od.isEmpty ? nil : od
+        s.speed = speed
+        s.sizeMode = size
+        return s
+    }
+
+    private func resolved(_ base: StripSettings, for video: String) -> StripSettings {
+        var s = base
+        if base.head < 0 {
+            s.head = (probeVideoInfo(video)?.2).flatMap { $0 > 0 ? 1.0 / $0 : nil } ?? 0
+        }
+        if base.tail <= 0 {
+            if let d = detectEnding(in: video) {
+                s.tail = cut == .keepFade ? d.tailAtWhite : d.tailAtFade
+            } else {
+                s.tail = -1      // 探测失败 → 让引擎报错，别乱切
+            }
+        }
+        return s
+    }
+
+    // MARK: 自动探测
+
+    private func autoDetect() {
+        guard let first = videos.first else { return }
+        detecting = true
+        detectInfo = ""
+        let mode = cut
+        DispatchQueue.global(qos: .utility).async {
+            let d = detectEnding(in: first)
+            DispatchQueue.main.async {
+                detecting = false
+                guard let d else {
+                    detectInfo = "没检测到白场片尾：这个视频可能本来就没加结尾，或画面整体太亮/太暗分不出白场，请手动填「片尾时长」"
+                    return
+                }
+                tailText = String(format: "%.2f", mode == .keepFade ? d.tailAtWhite : d.tailAtFade)
+                detectInfo = "总长 \(f2(d.total))s：正片结束于 \(f2(d.whiteStart))s（片尾 \(f2(d.tailAtWhite))s），"
+                    + "渐白起点 \(f2(d.fadeStart))s（片尾 \(f2(d.tailAtFade))s）"
+                    + " —— 已按「\(mode.label)」填入片尾时长"
+            }
+        }
+    }
+
+    private func f2(_ v: Double) -> String { String(format: "%.2f", v) }
+
+    // MARK: 执行
+
+    private func start() {
+        let list = videos
+        let base = baseSettings
+        let mode = cut
+        running = true
+        stopping = false
+        summary = ""
+        progressValue = 0
+        currentIdx = 0
+        RunControl.shared.begin()
+        let headDesc = headAuto ? "片头 1 帧（自动）" : "片头 \(headText) 秒"
+        let tailDesc = tailAuto ? "片尾自动探测" : "片尾 \(tailText) 秒"
+        logs = ["开始反推 \(list.count) 个视频：\(headDesc) / \(tailDesc)，切点「\(mode.label)」"]
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var okCount = 0, failCount = 0, stopped = false
+            let batchStart = Date()
+            for (i, video) in list.enumerated() {
+                if RunControl.shared.isCancelled { stopped = true; break }
+                let vName = URL(fileURLWithPath: video).lastPathComponent
+                DispatchQueue.main.async { currentIdx = i + 1 }
+                let s = resolved(base, for: video)
+                if s.tail < 0 {
+                    failCount += 1
+                    let line = "[\(i+1)/\(list.count)] \(vName) ✗ 没检测到白场片尾，请手动填「片尾时长」"
+                    DispatchQueue.main.async {
+                        logs.append(line)
+                        progressValue = Double(i + 1) / Double(list.count)
+                    }
+                    continue
+                }
+                let prog: (Double) -> Void = { frac in
+                    DispatchQueue.main.async {
+                        progressValue = min((Double(i) + max(0, min(frac, 1))) / Double(list.count), 1)
+                    }
+                }
+                let r = StripEngine.run(input: video, settings: s, onProgress: prog)
+                if r.success { okCount += 1 } else { failCount += 1 }
+                let line = "[\(i+1)/\(list.count)] \(vName) \(r.success ? "✓" : "✗") \(r.message)"
+                DispatchQueue.main.async {
+                    logs.append(line)
+                    if logs.count > 300 { logs.removeFirst(logs.count - 300) }
+                    progressValue = Double(i + 1) / Double(list.count)
+                }
+            }
+            let wall = Date().timeIntervalSince(batchStart)
+            let text: String
+            if stopped {
+                text = "已停止: 完成 \(okCount) 个，剩余 \(max(list.count - okCount - failCount, 0)) 个未处理 · 已用时 \(humanDuration(wall))"
+            } else {
+                text = "处理完成: 成功 \(okCount) 个, 失败 \(failCount) 个 · 总用时 \(humanDuration(wall))"
+            }
+            DispatchQueue.main.async {
+                running = false
+                stopping = false
+                RunControl.shared.reset()
+                summary = text
+                logs.append(text)
+            }
+        }
+    }
+
+    private func stop() {
+        guard running, !stopping else { return }
+        stopping = true
+        logs.append("正在停止…（等待当前视频的编码进程退出，已完成的不受影响）")
+        RunControl.shared.cancel()
+    }
+
+    // MARK: 文件
+
+    func pickVideos() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .video, .avi]
+        if panel.runModal() == .OK { videos = panel.urls.map { $0.path } }
+    }
+
+    func pickOutDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "选择输出文件夹"
+        if panel.runModal() == .OK, let url = panel.url { outputDir = url.path }
+    }
+
+    func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        var urls: [URL] = []
+        let group = DispatchGroup()
+        let q = DispatchQueue(label: "stripdrop")
+        for p in providers {
+            group.enter()
+            _ = p.loadObject(ofClass: URL.self) { url, _ in
+                if let url { q.async { urls.append(url); group.leave() } } else { group.leave() }
+            }
+        }
+        group.wait()
+        DispatchQueue.main.async { videos = urls.map { $0.path } }
+        return !urls.isEmpty
+    }
+
+    func openOutput() {
+        let od = outputDir.trimmingCharacters(in: .whitespaces)
+        let dir = od.isEmpty ? URL(fileURLWithPath: videos.first ?? "").deletingLastPathComponent().path : od
+        if FileManager.default.fileExists(atPath: dir) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: dir))
+        }
     }
 }
 

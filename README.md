@@ -2,7 +2,7 @@
 
 一款为短剧/批量视频后期处理打造的 macOS 原生工具（SwiftUI + 内置 ffmpeg），把「抽帧、封面与结尾、整理归档」三件事装进一个 App。
 
-![Version](https://img.shields.io/badge/version-3.20.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
+![Version](https://img.shields.io/badge/version-3.21.0-blue) ![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey) ![Swift](https://img.shields.io/badge/swift-5-orange)
 
 ![Release](https://img.shields.io/badge/release-latest-green)
 
@@ -43,7 +43,18 @@
 - 🎵 音效（可加偏移）／🔊 原视频音频淡出／⚡ 编码速度／📦 输出体积（跟随原片或高质量）
 - ⏱ 实时进度 + 每集用时，处理中可随时停止（已完成保留，半成品清理）
 
-### 3. 整理归档
+### 3. 反推（去片头片尾）
+
+- 把**已经加好片头片尾的成片**反向处理：切掉片头的封面帧和片尾的白场/定格段，还原出正片
+- **自动定位片尾**：扫描逐帧亮度（signalstats，3 分钟 1080p 约零点几秒），找到片尾白场的起点——不需要记得当初的参数；「探测第一个」自动回填片尾时长，也可以留空让每个视频各自探测
+- **两种切点**：
+  - **保留渐白过渡**：切在白场起点，长度与原片完全一致（但最后几秒是渐白画面——渐白是叠在正片最后几秒上的，原始像素已被覆盖，拿不回来）
+  - **连渐白一起切**：切在渐白之前，画面完全干净，但比原片短一个渐白时长
+- 片头时长默认按 1 帧自动算（本 App 加封面固定插 1 帧），其他工具加的片头可手动填秒数
+- 切点不在关键帧上，采用 seek + 重编码保证帧级精确；输出 `<原文件名>_正片.mp4`
+- CLI：`--strip <视频...> [--detect] [--drop-fade] [--head 秒] [--tail 秒] [-o 目录]`
+
+### 4. 整理归档
 
 ![整理归档](screenshots/03_整理归档.png)
 
@@ -51,7 +62,7 @@
 - **普通视频原地改名**（不再生成「成片」文件夹）；带 `(N)` 副本标记的归到「纯净」，字幕文件归到「字幕」
 - 执行前预览改名对照、重复/冲突检测、执行后一键撤销、导出 CSV 对照表
 
-### 4. 关于与更新
+### 5. 关于与更新
 
 ![关于与更新](screenshots/04_关于与更新.png)
 
