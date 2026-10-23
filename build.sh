@@ -19,7 +19,7 @@ RUN_TESTS=0
 [[ "${1:-}" == "--test" ]] && RUN_TESTS=1
 
 echo "==> 编译 GUI App（target ${TARGET}）"
-swiftc -disable-sandbox -O -target "$TARGET" -parse-as-library Logic.swift App.swift -o "$BIN"
+swiftc -disable-sandbox -O -target "$TARGET" -parse-as-library Logic.swift Notify.swift App.swift -o "$BIN"
 codesign --force -s - "$APP"
 
 echo "==> 编译 CLI（target ${TARGET}）"

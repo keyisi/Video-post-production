@@ -31,6 +31,8 @@ struct FrameToolApp: App {
             print("FFPROBE=\(ffprobeBin())")
             exit(0)
         }
+        // 提前把通知授权问好，避免第一次任务完成时才弹授权窗
+        JobNotify.warmUp()
     }
     var body: some Scene {
         WindowGroup("Video Post-Production") {
@@ -1308,6 +1310,7 @@ struct ExtractView: View {
                 running = false
                 summary = "完成: 保存 \(r.saved) 张, 跳过 \(r.skipped) 张"
                 logs.append(summary)
+                JobNotify.fire("视频抽帧", summary)
             }
         }
     }
@@ -2122,6 +2125,7 @@ struct ComposeView: View {
                 RunControl.shared.reset()
                 summary = summaryText
                 logs.append(summaryText)
+                if !stopped { JobNotify.fire("封面与结尾", summaryText) }
             }
         }
     }
@@ -2464,6 +2468,7 @@ struct StripView: View {
                 RunControl.shared.reset()
                 summary = text
                 logs.append(text)
+                if !stopped { JobNotify.fire("反推", text) }
             }
         }
     }
@@ -2981,6 +2986,9 @@ struct OrganizerView: View {
                 notes = r.notes
                 errors = r.errors
                 busy = false
+                JobNotify.fire("整理归档", result.moves.isEmpty
+                    ? "整理完成（没有需要移动的文件）"
+                    : "整理完成：已移动 \(result.moves.count) 个文件")
             }
         }
     }
@@ -3027,6 +3035,8 @@ struct OrganizerView: View {
 
 struct AboutView: View {
     @EnvironmentObject private var updates: UpdateCenter
+    @AppStorage("fxt_doneSound") private var doneSound = true
+    @AppStorage("fxt_doneNotify") private var doneNotify = true
 
     @State private var ffmpegVer = "检测中…"
     @State private var ffprobeVer = "检测中…"
@@ -3043,6 +3053,7 @@ struct AboutView: View {
             VStack(alignment: .leading, spacing: 14) {
                 headerCard
                 updateCard
+                reminderCard
                 notesCard
                 envCard
                 Spacer(minLength: 0)
@@ -3084,6 +3095,23 @@ struct AboutView: View {
                             .font(.system(size: 11.5, weight: .medium))
                     }
                 }
+            }
+        }
+    }
+
+    // MARK: 任务完成提醒
+
+    private var reminderCard: some View {
+        Card {
+            FieldLabel("bell.badge", "任务完成提醒")
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle("批量任务完成时播放提示音（Glass）", isOn: $doneSound)
+                    .toggleStyle(.switch)
+                Toggle("批量任务完成时发系统通知", isOn: $doneNotify)
+                    .toggleStyle(.switch)
+                Text("适用于抽帧 / 封面与结尾 / 反推 / 整理归档的批量执行；手动停止不提醒。通知首次开启会请求系统授权。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
         }
     }
